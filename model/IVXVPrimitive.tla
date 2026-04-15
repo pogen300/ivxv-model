@@ -2,6 +2,8 @@
 
 EXTENDS Integers, Sequences, TLC, FiniteSets
 
+CONSTANTS SecretKeys, Messages
+
 Empty == <<>>
 
 \* pk
@@ -19,6 +21,9 @@ Verify(pk, m, sig) ==
   /\ sig[1] = "sig"
   /\ sig[2] = pk
   /\ sig[3] = m
+
+Sign_Corr == \A sk \in SecretKeys, m \in Messages :
+    Verify(PubKey(sk), m, Sign(sk, m))
 
 \* certificate
 Cert(pk) == << "cert", pk >>
