@@ -23,6 +23,18 @@ DecProof_Corr == \A sk \in SecretKeys, m \in Messages, r \in Nonces :
 	LET c == EGEnc(PubKey(sk), m, r)
 	IN VerifyDecryptionProof(PubKey(sk), DecryptionProof(sk, c, EGDec(sk, c)))
 
+ThresholdRecover_Corr ==
+	\A sk \in SecretKeys :
+		LET params == ThresholdParams("dec", 2, 3)
+				shares == {ThresholdShare(1, params, sk), ThresholdShare(2, params, sk)}
+		IN RecoverThresholdKey(params, PubKey(sk), shares) = sk
+
+ThresholdRecover_NotEnoughSharesRejected ==
+	\A sk \in SecretKeys :
+		LET params == ThresholdParams("dec", 2, 3)
+				shares == {ThresholdShare(1, params, sk)}
+		IN RecoverThresholdKey(params, PubKey(sk), shares) = NoStr
+
 Primitive_Corr ==
 	/\ Sign_Corr
 	/\ AEADEnc_Corr
@@ -30,6 +42,8 @@ Primitive_Corr ==
 	/\ X509_TamperedSubjectPKRejected
 	/\ X509_TamperedSubjectRejected
 	/\ DecProof_Corr
+	/\ ThresholdRecover_Corr
+	/\ ThresholdRecover_NotEnoughSharesRejected
 
 ASSUME Primitive_Corr
 

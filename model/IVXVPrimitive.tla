@@ -1,7 +1,8 @@
 ------------------------------ MODULE IVXVPrimitive ------------------------------
 
 EXTENDS Integers, Sequences, TLC, FiniteSets
-
+NoInt == -1
+NoStr == ""
 Empty == <<>>
 
 \* pk
@@ -65,7 +66,6 @@ EGDec(sk, c) ==
   ELSE Empty
 
 DecryptionProof(sk,c, m) ==  [ sk |-> sk, c |-> c, m |-> m ]
-NoDecryptionProof == DecryptionProof(Empty, Empty, Empty)
 VerifyDecryptionProof(pk, dp) == 
 	/\ IsValidEGCiphertext(pk, dp.c)
 	/\ pk = PubKey(dp.sk) 
@@ -73,39 +73,32 @@ VerifyDecryptionProof(pk, dp) ==
 
 \* ideal threshold keys
 ThresholdParams(kind, t, n) == [ kind |-> kind, t |-> t, n |-> n ]
-ThresholdKey(params, sk) == [ params |-> params, sk |-> sk, pk |-> PubKey(sk) ]
-ThresholdShare(key, holderId) ==
+ThresholdShare(holderId, params, sk) ==
   [ holderId |-> holderId,
-    params   |-> key.params,
-    pk       |-> key.pk,
-    sk       |-> key.sk ]
+    params   |-> params,
+    sk       |-> sk ]
+ThresholdShareStore(ids, params, sk) == [ i \in ids |-> ThresholdShare(i, params, sk) ]
+SameThresholdParams(shares) ==
+  \A s1 \in shares, s2 \in shares : s1.params = s2.params /\ s1.sk = s2.sk
 
-EmptyThresholdShares(ids) == [ i \in ids |-> Empty ]
-ThresholdShareStore(key, holderIds) == [ i \in holderIds |-> ThresholdShare(key, i) ]
-
-SameThresholdKey(shares) ==
-  \A s1 \in shares, s2 \in shares :
-  	s1.params = s2.params /\ s1.pk = s2.pk /\ s1.sk = s2.sk
-DistinctShareHolders(shares) == Cardinality({ s.holderId : s \in shares }) = Cardinality(shares)
-EnoughThresholdShares(params, shares) == Cardinality(shares) >= params.t
-
+DistinctShareHolders(shares) == 
+Cardinality({ s.holderId : s \in shares }) = Cardinality(shares)
 ValidThresholdShareSet(params, pk, shares) ==
   /\ shares # {}
-  /\ EnoughThresholdShares(params, shares)
+  /\ Cardinality(shares) >= params.t
   /\ Cardinality(shares) <= params.n
   /\ DistinctShareHolders(shares)
-  /\ \A s \in shares : s.params = params /\ s.pk = pk
-  /\ SameThresholdKey(shares)
+  /\ \A s \in shares : s.params = params /\ PubKey(s.sk) = pk
+  /\ SameThresholdParams(shares)
 
 RecoverThresholdKey(params, pk, shares) ==
   IF ValidThresholdShareSet(params, pk, shares)
   THEN (CHOOSE s \in shares : TRUE).sk
-  ELSE Empty
+  ELSE NoStr
 
 ShoupSign(params, pk, shares, m) ==
-  IF ValidThresholdShareSet(params, pk, shares)
-  THEN Sign(RecoverThresholdKey(params, pk, shares), m)
-  ELSE Empty
+	LET sk == RecoverThresholdKey(params, pk, shares)
+	IN IF sk # NoStr THEN Sign(sk, m) ELSE Empty
 
 IdealMix(X) == X
 

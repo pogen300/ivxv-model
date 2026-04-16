@@ -24,7 +24,7 @@ SigThresholdParamsFromConfig(cfg) ==
 ThresholdShareStoreValues(shares) == {shares[i]: i \in DOMAIN shares}
 ThresholdShareStorePK(shares) ==
   LET vals == ThresholdShareStoreValues(shares)
-  IN IF vals # {} THEN ( CHOOSE s \in vals: TRUE ).pk ELSE Empty
+  IN IF vals # {} THEN PubKey(( CHOOSE s \in vals: TRUE ).sk) ELSE Empty
 
 RecoverKeyFromShares(params, pk, shares) ==
   RecoverThresholdKey(params, pk, ThresholdShareStoreValues(shares))

@@ -1,7 +1,6 @@
 ------------------------------ MODULE IVXVData ------------------------------
 EXTENDS IVXVPrimitive, Integers
-NoInt == -1
-NoStr == ""
+EmptyStore == [i \in {} |-> Empty]
 
 OCSPReq(signerCert) == [ signerCert |-> signerCert ]
 NoOCSPReq == OCSPReq(Empty)

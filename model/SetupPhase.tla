@@ -40,8 +40,8 @@ KHPids == KeyHolderIds
 
   fair process (KAProc = KAPid)
   variables
-    decShares = EmptyThresholdShares(KeyHolderIds),
-    sigShares = EmptyThresholdShares(KeyHolderIds),
+    decShares = EmptyStore,
+    sigShares = EmptyStore,
     certDec = Empty,
     certSig = Empty;
   {
@@ -155,7 +155,7 @@ KHPids == KeyHolderIds
   }
 }
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "40419c5b" /\ chksum(tla) = "758fb329")
+\* BEGIN TRANSLATION (chksum(pcal) = "9aa7ef43" /\ chksum(tla) = "d601049e")
 VARIABLES pc, chCSToEA, chKAToEA, chEAToCS, chEAToKA, chEAToVCD, chEAToVVD, 
           chEAToPA, chKAToKH, khSmartCardStore, csTspClientPK, csCfg, 
           decShares, sigShares, certDec, certSig, cryptoParams, eaPublicCfg, 
@@ -182,8 +182,8 @@ Init == (* Global variables *)
         /\ csTspClientPK = TSPClientPK
         /\ csCfg = Empty
         (* Process KAProc *)
-        /\ decShares = EmptyThresholdShares(KeyHolderIds)
-        /\ sigShares = EmptyThresholdShares(KeyHolderIds)
+        /\ decShares = EmptyStore
+        /\ sigShares = EmptyStore
         /\ certDec = Empty
         /\ certSig = Empty
         (* Process EAProc *)
