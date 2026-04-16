@@ -120,9 +120,6 @@ EmptyVoterBallot == VoterBallot(NoStr, {}, FALSE)
 BallotResponse(ballot, req, resp) == [ ballot |-> ballot, req |-> req, resp |-> resp ]
 EmptyBallotResponse == BallotResponse(EmptyBallot, NoTSPReq, NoTSPRes)
 
-DecryptionProof(c, m, a, b, s) ==  [ c |-> c, m |-> m, a |-> a, b |-> b, s |-> s ]
-NoDecryptionProof == DecryptionProof(Empty, Empty, Empty, Empty, Empty)
-
 PALogEntry(t, h, voterId, ballotId) == [ t |-> t, h |-> h, voterId  |-> voterId, ballotId |-> ballotId ]
 
 PAErrorLogEntry(ref, err) == [ ref |-> ref, err |-> err ]

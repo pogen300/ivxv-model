@@ -4,23 +4,7 @@ EXTENDS IVXVData
 StoreLookup(store, key) == IF key \in DOMAIN store THEN store[key] ELSE Empty
 
 StorePut(store, key, value) ==
-  [x \in DOMAIN store \cup { key } |-> IF x = key THEN value ELSE store[x]
-  ]
-
-CONSTANTS Keys, Values
-
-VARIABLES st1
-vars == << st1 >>
-Init ==
-  /\ st1 = Empty 
-Next == TRUE /\ UNCHANGED vars
-Spec == Init /\ [][Next]_vars
-
-Keystore_Corr ==
-  \A k \in Keys, v \in Values: StoreLookup(StorePut(st1, k, v), k) = v
-
-Keystore_Override ==
-  \A k \in Keys, v1 \in Values, v2 \in Values: StoreLookup(StorePut(StorePut(st1, k, v1), k, v2), k) = v2  
+  [ x \in DOMAIN store \cup { key } |-> IF x = key THEN value ELSE store[x] ]
 
 StoreDelete(store, key) == [x \in DOMAIN store \ { key } |-> store[x]]
 StoreValues(store) == {StoreLookup(store, k): k \in DOMAIN store}

@@ -145,8 +145,7 @@ Tally_ShoupSign(cfg, shares, m) == ShoupSign(SigThresholdParamsFromConfig(cfg), 
 
 \* DecryptBallotbox 
 Tally_DecryptBB(bbMixed, sk) ==
-  { DecryptedVote(a.d, a.p, a.q, a.ct, 
-  		DecryptionProof(a.ct, EGDec(sk, a.ct), Empty, Empty, Empty)) :
+  { DecryptedVote(a.d, a.p, a.q, a.ct, DecryptionProof(sk, a.ct, EGDec(sk, a.ct))) :
   	a \in bbMixed }
 
 \* ComputeElectionResult

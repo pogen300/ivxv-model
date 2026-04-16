@@ -26,6 +26,7 @@
 ### Modelled
 
 - [x] 69 BDOC - Modelled as `[ct, cert, sig, tbs]`
+- [x] 71 X509Certificate 116 - cert is modelled abstractly with `Cert()` and `CertPK()`.
 - [x] 72 StorageDB - modelled as `csBallotStore, csSessionStore, csLatest`
 - [x] 73 AuthenticateSession
 - [x] 74 GetValidSession - `StoreLookup`
@@ -54,7 +55,6 @@
 
 ### Not Modelled
 - [ ] 70 XAdESSignature - model signature as sig bytes
-- [ ] 71 X509Certificate 116 - cert is modelled abstractly with `Cert()` and `CertPK()`.
 - [ ] 76 CandidateList - no data struct needed when we model Candidate as str
 - [ ] 77 Candidate - Simplified to a hardcoded string
 - [ ] 90 BTElement

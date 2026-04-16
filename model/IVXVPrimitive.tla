@@ -2,8 +2,6 @@
 
 EXTENDS Integers, Sequences, TLC, FiniteSets
 
-CONSTANTS SecretKeys, Messages
-
 Empty == <<>>
 
 \* pk
@@ -21,9 +19,6 @@ Verify(pk, m, sig) ==
   /\ sig[1] = "sig"
   /\ sig[2] = pk
   /\ sig[3] = m
-
-Sign_Corr == \A sk \in SecretKeys, m \in Messages :
-    Verify(PubKey(sk), m, Sign(sk, m))
 
 \* certificate
 Cert(pk) == << "cert", pk >>
@@ -57,23 +52,24 @@ EGCheckRandomness(c, r) ==
   /\ c[1] = "eg"
   /\ c[4] = r
 
-IsEGCiphertextFor(pk, c) ==
+\* Abstract ciphertext validity check
+IsValidEGCiphertext(pk, c) ==
   /\ c # Empty
   /\ Len(c) = 4
   /\ c[1] = "eg"
   /\ c[2] = pk
 
 EGDec(sk, c) ==
-  IF /\ c # Empty
-     /\ Len(c) = 4
-     /\ c[1] = "eg"
-     /\ c[2] = PubKey(sk)
+  IF	/\ IsValidEGCiphertext(PubKey(sk), c)
   THEN c[3]
   ELSE Empty
 
-VerifyDecryptionProof(pk, dp) ==
-  /\ IsEGCiphertextFor(pk, dp.c)
-  /\ dp.m = dp.c[3]
+DecryptionProof(sk,c, m) ==  [ sk |-> sk, c |-> c, m |-> m ]
+NoDecryptionProof == DecryptionProof(Empty, Empty, Empty)
+VerifyDecryptionProof(pk, dp) == 
+	/\ IsValidEGCiphertext(pk, dp.c)
+	/\ pk = PubKey(dp.sk) 
+	/\ EGDec(dp.sk, dp.c) = dp.m
 
 \* ideal threshold keys
 ThresholdParams(kind, t, n) == [ kind |-> kind, t |-> t, n |-> n ]
