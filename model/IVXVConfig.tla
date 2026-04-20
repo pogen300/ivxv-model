@@ -1,5 +1,5 @@
 ------------------------------ MODULE IVXVConfig ------------------------------
-EXTENDS Integers, IVXVData, IVXVHelper
+EXTENDS Integers, IVXVPrimitive, IVXVHelper
 
 \* Model secrets
 ElectionSK == "electionSK"
@@ -43,11 +43,11 @@ VoterList ==
   @@ "voter3" :> Voter("voter3", "D3", "P3")
 
 \* Setup phase
-ExpectedCryptoParams == CryptoParams(Threshold, ThresholdN, EGParams, RSAParams)
-ExpectedDecThresholdParams == DecThresholdParamsFromCrypto(ExpectedCryptoParams)
-ExpectedSigThresholdParams == SigThresholdParamsFromCrypto(ExpectedCryptoParams)
-GenerateKeyShares(params, ids, t, n) == ThresholdShareStore(ids, ThresholdParams(params, t, n), ElectionSK)
-GenerateSignKeyShares(params, ids, t, n) == ThresholdShareStore(ids, ThresholdParams(params, t, n), ElectionSignSK)
+ExpectedDecThresholdParams == ThresholdParams(EGParams, Threshold, ThresholdN)
+ExpectedSigThresholdParams == ThresholdParams(RSAParams, Threshold, ThresholdN)
+ExpectedCryptoParams == CryptoParams(ExpectedDecThresholdParams, ExpectedSigThresholdParams)
+GenerateKeyShares(params, ids) == ThresholdShareStore(ids, params, ElectionSK)
+GenerateSignKeyShares(params, ids) == ThresholdShareStore(ids, params, ElectionSignSK)
 ExpectedDecShares == ThresholdShareStore(KeyHolderIds, ExpectedDecThresholdParams, ElectionSK)
 ExpectedSigShares == ThresholdShareStore(KeyHolderIds, ExpectedSigThresholdParams, ElectionSignSK)
 ExpectedSmartCardStore == [i \in KeyHolderIds |-> SmartCardData(i, ExpectedDecShares[i], ExpectedSigShares[i]) ]
@@ -74,11 +74,18 @@ ExpectedPublicConfig ==
 ExpectedCSConfig == CSConfig(ExpectedPublicConfig, StageTTL, VerifyWindow, VerifyCountLimit, TSPPastSlack, TSPFutureSlack, VoterList)
 
 \* Voting phase
-\* proc in voting phase should not access config constants above this point
-\* as they are supposed to be accessed by their owner during setup phase and shared
-\* with other participants to build their local config. Invariants bind local config
-\* to expected config, and these expected configs serve as the input for the voting phase
-\* exceptions: Reg service can still access TSPClientSK, TSPRegSK, TSPRegCert, OCSPSK, OCSPCert
+\* subphase time oracle: this is used to address the challenge with using a global clock + arbitrary stage time
+PhaseStartTime == 0
+PhaseAuthTime == 1
+PhaseAuthStatusTime == 2
+PhaseChoicesTime == 3
+PhaseCertTime == 4
+PhaseSignTime == 5
+PhaseSignStatusTime == 6
+PhaseVoteSubmittedTime == 7
+PhaseTSPTime == 8
+PhaseOCSPTime == 9
+PhaseVerifyTime == 10
 
 \* Model secrets
 CSFreshnessStore == 
@@ -94,74 +101,76 @@ ProviderFreshnessStore ==
 VCDFreshnessStore(clientId) == 
 	[i \in 1..MAXFRESH |-> [ r |-> <<"vcdRand", clientId, i>> ]]
 
-ClientIds == {1, 2}
+ClientIds == {1, 2, 3}
 
-VoterInputStore ==
-  1 :> [ voterRef |-> VoterRef("voter1", "37200007"), choice |-> "Alice" ]
-  @@ 2 :> [ voterRef |-> VoterRef("voter2", "37200008"), choice |-> "Bob" ]
+\* Private to voter
+VoterProfilesStore ==
+  1 :> VoterRef("voter1", "37200007")
+  @@ 2 :> VoterRef("voter2", "37200008")
+  @@ 3 :> VoterRef("voter3", "37200009")
 
+\* Private to sign device
 SignInputStore ==
   [i \in ClientIds |->
-    LET phone == VoterInputStore[i].voterRef.phone IN 
+    LET phone == VoterProfilesStore[i].phone IN 
 			[ phone |-> phone, sk |-> SignSKStore[phone] ]]
 
-VCDConfigStore == [i \in ClientIds |-> ExpectedPublicConfig]
-VVDConfigStore == [i \in ClientIds |-> ExpectedPublicConfig]
-CSSymKey == "CSSymKey"
-
-\* Private to Provider, stores voter certs issued by CA
+\* Private to Provider, stores voter certs issued by CA, maps phone to cert
 ProviderCertStore ==
   "37200007" :> IssueX509Cert(RootCASK, PubKey("simSK1"), "voter1")
   @@ "37200008" :> IssueX509Cert(RootCASK, PubKey("simSK2"), "voter2")
   @@ "37200009" :> IssueX509Cert(RootCASK, PubKey("simSK3"), "voter3")
 
+VCDConfigStore == [i \in ClientIds |-> ExpectedPublicConfig]
+VVDConfigStore == [i \in ClientIds |-> ExpectedPublicConfig]
+CSSymKey == "CSSymKey"
+AllowVotingFaultInjection == FALSE
 
-\* TODO remove/replace below config for voting phase 
-ReactionTimeVoter == StageTTL
-VerifyWindowVoter == VerifyWindow
-VoterId == "voter1"
-Phone == "37200007"
-SimSK == "simSK1"
-VoterProfiles ==
-  "voter1" :> "37200007"
-  @@ "voter2" :> "37200008"
-  @@ "voter3" :> "37200009"
+\* Sequential voting scenarios, each picks a voter profile and sign secret from corresponding stores and specifies one choice
+HonestVote(clientId, choice) == [ kind |-> "HonestVote", clientId |-> clientId, choice |-> choice ]
+VotingScenario ==
+  << HonestVote(1, "Bob"),
+     HonestVote(1, "Alice"),
+     HonestVote(2, "Alice"),
+     HonestVote(3, "Bob"),
+     HonestVote(3, "Alice") >>
+ScenarioIds == 1..Len(VotingScenario)
+ScenarioClient(i) == VotingScenario[i].clientId
+ScenarioVoterProfile(i) == VoterProfilesStore[ScenarioClient(i)]
+ScenarioChoice(i) == VotingScenario[i].choice
+ScenarioSignSK(i) == SignInputStore[ScenarioClient(i)].sk
+ScenarioVCDRand(i) == VCDFreshnessStore(ScenarioClient(i))[i].r
+ScenarioVid(i) == CSFreshnessStore[i].issuedVid
+ScenarioIdForVid(vid) == CHOOSE i \in ScenarioIds : ScenarioVid(i) = vid
 
+\* Voting-phase expected output derived from VotingScenario
+BuildScenarioStoredVote(i) ==
+  LET voterProfile == ScenarioVoterProfile(i)
+      voterId == voterProfile.voterId
+      phone == voterProfile.phone
+      cert == ProviderCertStore[phone]
+      ct == EGEnc(ExpectedPublicConfig.decCert.pk, ScenarioChoice(i), ScenarioVCDRand(i))
+      bdoc == SignedBDOC(ct, cert, Sign(SignSKStore[phone], DigestOf(ct, cert)))
+      req == TSPReq(Hash(bdoc.sig), Sign(TSPClientSK, Hash(bdoc.sig)))
+      tsp == TSPRes(req.m, req.n, PhaseTSPTime, ExpectedPublicConfig.tspRegCert, Sign(TSPRegSK, << req.m, req.n, PhaseTSPTime >>))
+      ocspReq == OCSPReq(bdoc.signerCert)
+      ocsp == OCSPRes(ocspReq, TRUE, PhaseOCSPTime, ExpectedPublicConfig.ocspCert, Sign(OCSPSK, << ocspReq, TRUE, PhaseOCSPTime >>))
+  IN  StoredVote(ScenarioVid(i), voterId, PhaseVoteSubmittedTime, bdoc, tsp, ocsp, 0)
 
-\* TODO voting phase currently only support one vote, the expected data is not bind to any invariant
-\* it is only to provide input for tally phase
-BuildStoredVote(vid, voterId, choice, submitted, tspTime, ocspTime) ==
-  LET ct == EGEnc(ExpectedPublicConfig.decCert.pk, choice, submitted)
-  phone == VoterProfiles[voterId]
-  cert == ProviderCertStore[phone]
-  bdoc == SignedBDOC(ct, cert, Sign(SignSKStore[phone], DigestOf(ct, cert)))
-  req == TSPReq(Hash(bdoc.sig), Sign(TSPClientSK, Hash(bdoc.sig)))
-  tsp == TSPRes(req.m, req.n, tspTime, ExpectedPublicConfig.tspRegCert, Sign(TSPRegSK, << req.m, req.n, tspTime >>))
-  ocspReq == OCSPReq(bdoc.signerCert)
-  ocsp == OCSPRes(ocspReq, TRUE, ocspTime, ExpectedPublicConfig.ocspCert, Sign(OCSPSK, << ocspReq, TRUE, ocspTime >>))
-  IN  StoredVote(vid, voterId, submitted, bdoc, tsp, ocsp, 0)
+ExpectedCSExportFromScenario ==
+  [vid \in { ScenarioVid(i) : i \in ScenarioIds } |-> BuildScenarioStoredVote(ScenarioIdForVid(vid))]
 
-ExpectedCSExport ==
-  1000 :> BuildStoredVote(1000, "voter1", "Bob", 1, 1, 2)
-  @@ 1001 :> BuildStoredVote(1001, "voter1", "Alice", 2, 2, 3)
-  @@ 1002 :> BuildStoredVote(1002, "voter2", "Alice", 3, 3, 4)
-  @@ 1003 :> BuildStoredVote(1003, "voter3", "Bob", 4, 4, 5)
-  @@ 1004 :> BuildStoredVote(1004, "voter3", "Alice", 5, 5, 6)
-
-ExpectedRegExport ==
-  1 :> RegLogEntry(ExtractTSPReqFromResp(ExpectedCSExport[1000].tsp), ExpectedCSExport[1000].tsp)
-  @@ 2 :> RegLogEntry(ExtractTSPReqFromResp(ExpectedCSExport[1001].tsp), ExpectedCSExport[1001].tsp)
-  @@ 3 :> RegLogEntry(ExtractTSPReqFromResp(ExpectedCSExport[1002].tsp), ExpectedCSExport[1002].tsp)
-  @@ 4 :> RegLogEntry(ExtractTSPReqFromResp(ExpectedCSExport[1003].tsp), ExpectedCSExport[1003].tsp)
-  @@ 5 :> RegLogEntry(ExtractTSPReqFromResp(ExpectedCSExport[1004].tsp), ExpectedCSExport[1004].tsp)
-
+ExpectedRegExportFromScenario ==
+  [i \in ScenarioIds |->
+    LET vote == ExpectedCSExportFromScenario[ScenarioVid(i)] IN
+      RegLogEntry(ExtractTSPReqFromResp(vote.tsp), vote.tsp)]
 
 \* Tally phase
-ExpectedRevokeList == {"voter2"}
+RevokeList == {"voter2"}
 ExpectedVotingExport ==
-  [ csExport   |-> ExpectedCSExport,
-    regExport  |-> ExpectedRegExport,
-    revokeList |-> ExpectedRevokeList ]
+  [ csExport   |-> ExpectedCSExportFromScenario,
+    regExport  |-> ExpectedRegExportFromScenario,
+    revokeList |-> RevokeList ]
 
 KHData == ExpectedSmartCardStore
 EmptyKHData == EmptySmartCardStore(KeyHolderIds)

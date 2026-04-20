@@ -1,5 +1,8 @@
 ------------------------------ MODULE IVXVData ------------------------------
-EXTENDS IVXVPrimitive, Integers
+EXTENDS  Integers
+NoInt == -1
+NoStr == ""
+Empty == <<>>
 EmptyStore == [i \in {} |-> Empty]
 
 OCSPReq(signerCert) == [ signerCert |-> signerCert ]
@@ -18,15 +21,16 @@ NoVoterRef == VoterRef(NoStr, NoStr)
 BDOC(ct, signerCert, sig, tbs) == [ ct |-> ct, signerCert |-> signerCert, sig |-> sig, tbs |-> tbs ]
 EmptyBDOC == BDOC(Empty, Empty, Empty, Empty)
 
-SessionCtx(authChallenge, authTokNonce, issuedVid, signDigest, voteVid, tspReq, ocspReq) ==
+SessionCtx(authChallenge, authTokNonce, issuedVid, signDigest, voteVid, tspReq, ocspReq, clientId) ==
   [ authChallenge |-> authChallenge,
     authTokNonce  |-> authTokNonce,
     issuedVid     |-> issuedVid,
     signDigest    |-> signDigest,
     voteVid       |-> voteVid,
     tspReq        |-> tspReq,
-    ocspReq       |-> ocspReq ]
-EmptySessionCtx == SessionCtx(Empty, Empty, NoInt, Empty, NoInt, NoTSPReq, NoOCSPReq)
+    ocspReq       |-> ocspReq,
+    clientId      |-> clientId ]
+EmptySessionCtx == SessionCtx(Empty, Empty, NoInt, Empty, NoInt, NoTSPReq, NoOCSPReq, NoInt)
 
 SessionData(sid, phase, voterId, phone, tok, exp, ctx) ==
   [ sid     |-> sid,
@@ -63,11 +67,7 @@ SmartCardData(holderId, decShare, sigShare) == [ holderId |-> holderId, decShare
 EmptySmartCardData(holderId) == SmartCardData(holderId, Empty, Empty)
 EmptySmartCardStore(ids) == [i \in ids |-> SmartCardData(i, Empty, Empty)]
 
-CryptoParams(t, n, decParams, sigParams) == 
-	[ t 				|-> t,
-		n 				|-> n,
-		decParams |-> decParams,
-		sigParams |-> sigParams ]
+CryptoParams(dec, sig) == [ dec |-> dec, sig |-> sig ]
 
 PublicElectionConfig(electionId, question, choices, decCert, sigCert, rootCACert, tspClientPK, tspRegCert, ocspCert, cryptoParams) ==
   [ electionId  	|-> electionId,
@@ -155,7 +155,7 @@ EmptyVCDCtx ==
     sidAuth |-> NoInt,
     sidSign |-> NoInt,
     tok     |-> Empty,
-    r       |-> NoInt,
+    r       |-> Empty,
     choices |-> {},
     bdoc    |-> EmptyBDOC ]
 

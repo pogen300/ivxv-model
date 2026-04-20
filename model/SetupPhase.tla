@@ -47,16 +47,16 @@ KHPids == KeyHolderIds
   {
   KA_KeyAppInit:
     await chEAToKA.tag = "StartSetup";
-    with (decParams = DecThresholdParamsFromCrypto(chEAToKA.body.cryptoParams),
-          sigParams = SigThresholdParamsFromCrypto(chEAToKA.body.cryptoParams)) {
-      with (newDecShares = GenerateKeyShares(chEAToKA.body.cryptoParams.decParams, KeyHolderIds, chEAToKA.body.cryptoParams.t, chEAToKA.body.cryptoParams.n),
-            newSigShares = GenerateSignKeyShares(chEAToKA.body.cryptoParams.sigParams, KeyHolderIds, chEAToKA.body.cryptoParams.t, chEAToKA.body.cryptoParams.n)) {
+    with (decParams = chEAToKA.body.cryptoParams.dec,
+          sigParams = chEAToKA.body.cryptoParams.sig) {
+      with (newDecShares = GenerateKeyShares(decParams, KeyHolderIds),
+            newSigShares = GenerateSignKeyShares(sigParams, KeyHolderIds)) {
         decShares := newDecShares;
         sigShares := newSigShares;
         with (decPK = ThresholdShareStorePK(newDecShares), sigPK = ThresholdShareStorePK(newSigShares)) {
           with (decSK = RecoverKeyFromShares(decParams, decPK, newDecShares),
                 sigSK = RecoverKeyFromShares(sigParams, sigPK, newSigShares)) {
-            with (sigShareSet = ThresholdShareStoreValues(newSigShares)) {
+            with (sigShareSet = {newSigShares[i]: i \in DOMAIN newSigShares}) {
               certDec := X509Cert(decPK, NoStr, Cert(sigPK), ShoupSign(sigParams, sigPK, sigShareSet, Hash(<< decPK, NoStr >>)));
               certSig := X509Cert(sigPK, NoStr, Cert(sigPK), ShoupSign(sigParams, sigPK, sigShareSet, Hash(<< sigPK, NoStr >>)));
               assert PubKey(decSK) = decPK;
@@ -76,7 +76,7 @@ KHPids == KeyHolderIds
 
 	  fair process (EAProc = EAPid)
 	  variables
-	  	cryptoParams = CryptoParams(Threshold, ThresholdN, EGParams, RSAParams),
+	  	cryptoParams = ExpectedCryptoParams,
 	    eaPublicCfg = PublicElectionConfig(ElectionId, Question1, CandidateList, Empty, Empty, RootCACert, Empty, TSPRegCert, OCSPCert, cryptoParams);
   {
   EA_SendCryptoParams:
@@ -155,7 +155,7 @@ KHPids == KeyHolderIds
   }
 }
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "9aa7ef43" /\ chksum(tla) = "d601049e")
+\* BEGIN TRANSLATION (chksum(pcal) = "81d91210" /\ chksum(tla) = "269c2634")
 VARIABLES pc, chCSToEA, chKAToEA, chEAToCS, chEAToKA, chEAToVCD, chEAToVVD, 
           chEAToPA, chKAToKH, khSmartCardStore, csTspClientPK, csCfg, 
           decShares, sigShares, certDec, certSig, cryptoParams, eaPublicCfg, 
@@ -187,7 +187,7 @@ Init == (* Global variables *)
         /\ certDec = Empty
         /\ certSig = Empty
         (* Process EAProc *)
-        /\ cryptoParams = CryptoParams(Threshold, ThresholdN, EGParams, RSAParams)
+        /\ cryptoParams = ExpectedCryptoParams
         /\ eaPublicCfg = PublicElectionConfig(ElectionId, Question1, CandidateList, Empty, Empty, RootCACert, Empty, TSPRegCert, OCSPCert, cryptoParams)
         (* Process VCDProc *)
         /\ vcdPublicCfg = EmptyPublicElectionConfig
@@ -238,17 +238,17 @@ CSProc == CS_ShareTSPClientPK \/ CS_RecvCSConfig \/ CS_Done
 
 KA_KeyAppInit == /\ pc[KAPid] = "KA_KeyAppInit"
                  /\ chEAToKA.tag = "StartSetup"
-                 /\ LET decParams == DecThresholdParamsFromCrypto(chEAToKA.body.cryptoParams) IN
-                      LET sigParams == SigThresholdParamsFromCrypto(chEAToKA.body.cryptoParams) IN
-                        LET newDecShares == GenerateKeyShares(chEAToKA.body.cryptoParams.decParams, KeyHolderIds, chEAToKA.body.cryptoParams.t, chEAToKA.body.cryptoParams.n) IN
-                          LET newSigShares == GenerateSignKeyShares(chEAToKA.body.cryptoParams.sigParams, KeyHolderIds, chEAToKA.body.cryptoParams.t, chEAToKA.body.cryptoParams.n) IN
+                 /\ LET decParams == chEAToKA.body.cryptoParams.dec IN
+                      LET sigParams == chEAToKA.body.cryptoParams.sig IN
+                        LET newDecShares == GenerateKeyShares(decParams, KeyHolderIds) IN
+                          LET newSigShares == GenerateSignKeyShares(sigParams, KeyHolderIds) IN
                             /\ decShares' = newDecShares
                             /\ sigShares' = newSigShares
                             /\ LET decPK == ThresholdShareStorePK(newDecShares) IN
                                  LET sigPK == ThresholdShareStorePK(newSigShares) IN
                                    LET decSK == RecoverKeyFromShares(decParams, decPK, newDecShares) IN
                                      LET sigSK == RecoverKeyFromShares(sigParams, sigPK, newSigShares) IN
-                                       LET sigShareSet == ThresholdShareStoreValues(newSigShares) IN
+                                       LET sigShareSet == {newSigShares[i]: i \in DOMAIN newSigShares} IN
                                          /\ certDec' = X509Cert(decPK, NoStr, Cert(sigPK), ShoupSign(sigParams, sigPK, sigShareSet, Hash(<< decPK, NoStr >>)))
                                          /\ certSig' = X509Cert(sigPK, NoStr, Cert(sigPK), ShoupSign(sigParams, sigPK, sigShareSet, Hash(<< sigPK, NoStr >>)))
                                          /\ Assert(PubKey(decSK) = decPK, 

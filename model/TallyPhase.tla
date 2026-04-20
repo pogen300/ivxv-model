@@ -92,7 +92,8 @@ CheckTool_BuildCheckedBB(cfg, voterList, csExport, regExport) ==
   LET checkedCSExport == LoadBallotFileRecord(cfg, voterList, csExport)
 			checkedRegExport == LoadRegData(regExport)
 			consistency == CheckCSRegConsistency(checkedCSExport.good, checkedRegExport.good)
-			checkedBallotResponses == StoreValues(consistency.good)
+			checkedBallotResponses == 
+				LET store == consistency.good IN {StoreLookup(store, k): k \in DOMAIN store}
 			voters == { br.ballot.voter.voterId : br \in checkedBallotResponses }
   IN  { VoterBallot(voterId, BallotsByVoterId(voterId, checkedBallotResponses) , FALSE)  : voterId \in voters } \* VoterBallot
 
@@ -138,10 +139,10 @@ AnonTool_AnonLog(bbFiltered) == { PALogEntry(0, Hash(a.ct), NoStr, NoStr) : a \i
 \* Tally
 \* ======================
 \* RecoverDecryption
-Tally_RecoverElectionSK(cfg, shares) == RecoverThresholdKey(DecThresholdParamsFromConfig(cfg), cfg.decCert.pk, { s.decShare : s \in shares })
+Tally_RecoverElectionSK(cfg, shares) == RecoverThresholdKey(cfg.cryptoParams.dec, cfg.decCert.pk, { s.decShare : s \in shares })
 TallySigTBS(tally) == Hash(<< "tally", tally >>)
 PlainSigTBS(plain) == Hash(<< "plain", plain >>)
-Tally_ShoupSign(cfg, shares, m) == ShoupSign(SigThresholdParamsFromConfig(cfg), cfg.sigCert.pk, { s.sigShare : s \in shares }, m)
+Tally_ShoupSign(cfg, shares, m) == ShoupSign(cfg.cryptoParams.sig, cfg.sigCert.pk, { s.sigShare : s \in shares }, m)
 
 \* DecryptBallotbox 
 Tally_DecryptBB(bbMixed, sk) ==
@@ -1040,7 +1041,10 @@ Inv_PA_FilterKeepsLatest ==
 			vb.voterId \notin eaRevokeList /\ vb.ballots # {}
          => \E b \in paFilteredBB :
               /\ b.voter.voterId = vb.voterId
-              /\ \A other \in vb.ballots : b.t >= other.t
+              /\ \A other \in vb.ballots :
+                   \/ b.t > other.t
+                   \/ /\ b.t = other.t
+                      /\ b.id >= other.id
 
 Inv_Voter1LatestTallied == 
 	AuditReady =>

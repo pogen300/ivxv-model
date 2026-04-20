@@ -1,36 +1,22 @@
 ---- MODULE IVXVHelper ----
-EXTENDS IVXVData
+EXTENDS IVXVPrimitive
 
 StoreLookup(store, key) == IF key \in DOMAIN store THEN store[key] ELSE Empty
-
 StorePut(store, key, value) ==
-  [ x \in DOMAIN store \cup { key } |-> IF x = key THEN value ELSE store[x] ]
-
+	[ x \in DOMAIN store \cup { key } |-> IF x = key THEN value ELSE store[x] ]
 StoreDelete(store, key) == [x \in DOMAIN store \ { key } |-> store[x]]
-StoreValues(store) == {StoreLookup(store, k): k \in DOMAIN store}
+
 DigestOf(ct, cert) == Hash(<< ct, cert >>)
 SignedBDOC(c, cert, sig) == BDOC(c, cert, sig, DigestOf(c, cert))
 UnsignedBDOC(c, cert) == BDOC(c, cert, Empty, DigestOf(c, cert))
 
-\* Setup
-DecThresholdParamsFromCrypto(cryptoParams) ==
-  ThresholdParams(cryptoParams.decParams, cryptoParams.t, cryptoParams.n)
-SigThresholdParamsFromCrypto(cryptoParams) ==
-  ThresholdParams(cryptoParams.sigParams, cryptoParams.t, cryptoParams.n)
-DecThresholdParamsFromConfig(cfg) ==
-  DecThresholdParamsFromCrypto(cfg.cryptoParams)
-SigThresholdParamsFromConfig(cfg) ==
-  SigThresholdParamsFromCrypto(cfg.cryptoParams)
-ThresholdShareStoreValues(shares) == {shares[i]: i \in DOMAIN shares}
 ThresholdShareStorePK(shares) ==
-  LET vals == ThresholdShareStoreValues(shares)
-  IN IF vals # {} THEN PubKey(( CHOOSE s \in vals: TRUE ).sk) ELSE Empty
+  LET vals == {shares[i]: i \in DOMAIN shares}
+  IN IF vals # {} THEN PubKey(( CHOOSE s \in vals: TRUE ).witness) ELSE Empty
 
 RecoverKeyFromShares(params, pk, shares) ==
-  RecoverThresholdKey(params, pk, ThresholdShareStoreValues(shares))
-DecryptShareStore(cardStore) ==
-  [i \in DOMAIN cardStore |-> cardStore[i].decShare
-  ]
+  RecoverThresholdKey(params, pk, {shares[i]: i \in DOMAIN shares})
+DecryptShareStore(cardStore) == [ i \in DOMAIN cardStore |-> cardStore[i].decShare ]
 SignShareStore(cardStore) == [i \in DOMAIN cardStore |-> cardStore[i].sigShare]
 
 \* Voting
@@ -53,31 +39,31 @@ ProviderSidForPhone(store, phone, kind) ==
   IF ProviderSidsForPhone(store, phone, kind) # {}
   THEN CHOOSE sid \in ProviderSidsForPhone(store, phone, kind): TRUE
   ELSE NoInt
+ExtractTSPReqFromResp(res) == TSPReq(res.m, res.n)
 
 \* Tally
-Elems(store) == {store[v]: v \in DOMAIN store}
 BallotHash(b) == Hash(<< b.id, b.t, b.votes >>)
-ExtractTSPReqFromResp(res) == TSPReq(res.m, res.n)
 RegReqs(regExport) == {regExport[i].req: i \in DOMAIN regExport}
-RegIdxsForReq(req, regExport) ==
-  {i \in DOMAIN regExport: regExport[i].req = req}
-
-BallotsByVoterId(voterId, checkedBB) ==
-  {br.ballot:
-    br \in {x \in checkedBB: x.ballot.voter.voterId = voterId}
-  }
-
+RegIdxsForReq(req, regExport) == { i \in DOMAIN regExport: regExport[i].req = req }
 BallotRespIdxsForResp(resp, brMap) == {i \in DOMAIN brMap: brMap[i].resp = resp}
-
 KeepEarliestBallotResp(i, brMap) ==
   \A j \in BallotRespIdxsForResp(brMap[i].resp, brMap):
     \/ brMap[i].ballot.t < brMap[j].ballot.t
     \/ /\ brMap[i].ballot.t = brMap[j].ballot.t
        /\ i <= j
 
+BallotsByVoterId(voterId, checkedBB) ==
+  { br.ballot : 
+  		br \in { x \in checkedBB : 
+  			x.ballot.voter.voterId = voterId }}
+
 LatestBallot(ballots) ==
   IF ballots # {}
-  THEN CHOOSE b \in ballots: \A other \in ballots: b.t >= other.t
+  THEN CHOOSE b \in ballots:
+         \A other \in ballots:
+           \/ b.t > other.t
+           \/ /\ b.t = other.t
+              /\ b.id >= other.id
   ELSE EmptyBallot
 
 \* IsValidChoice
