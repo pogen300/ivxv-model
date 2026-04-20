@@ -95,6 +95,7 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
                IN [ ok |-> TRUE, session |-> updated, store |-> StorePut(store, sid, updated) ]
           ELSE [ ok |-> FALSE, session |-> Empty, store |-> store ]
 
+(* This algorithm captures the voting phase *)
 (*--algorithm VotingPhase {
   variables
     scenarioIdx = 1,
@@ -116,6 +117,7 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     chCSToVVD = NoMsg,
     chVVDToVoter = NoMsg;
 
+  (* This process captures the voter's actions in the voting phase *)
   fair process (VoterProc = VoterPid)
   variables
     voterScenarioIdx = 1,
@@ -212,6 +214,7 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     };
   }
 
+  (* This process captures the vote casting device's actions in the voting phase *)
   fair process (VCDProc = VCDPid)
   variables
     vcdScenarioIdx = 1,
@@ -330,6 +333,7 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     };
   }
 
+  (* This process captures the collector service's actions in the voting phase *)
   fair process (CSProc = CSPid)
   variables
     csScenarioIdx = 1,
@@ -599,6 +603,7 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     };
   }
 
+  (* This process captures the id providers's actions in the voting phase *)
   fair process (ProviderProc = ProviderPid)
   variables
     providerScenarioIdx = 1,
@@ -694,6 +699,7 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     };
   }
 
+  (* This process captures the signing devices's actions in the voting phase *)
   fair process (SignProc = SignPid)
   variables
     signScenarioIdx = 1,
@@ -744,6 +750,7 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     };
   }
 
+  (* This process captures the registration services's actions in the voting phase *) 
   fair process (RegProc = RegPid)
   variables
     regScenarioIdx = 1,
@@ -807,6 +814,7 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     };
   }
 
+  (* This process captures the vote verification device's actions in the voting phase *) 
   fair process (VVDProc = VVDPid)
   variables
     vvdScenarioIdx = 1,
@@ -857,6 +865,9 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
   }
 }
 end algorithm; *)
+
+(* We now begin to enode various properties and invariants for the code above *)
+
 \* BEGIN TRANSLATION (chksum(pcal) = "293469ce" /\ chksum(tla) = "5a418d82")
 VARIABLES pc, scenarioIdx, chVoterToVCD, chVCDToVoter, chVCDToCS, chCSToVCD, 
           chCSToProvider, chProviderToCS, chProviderToSign, chSignToProvider, 
