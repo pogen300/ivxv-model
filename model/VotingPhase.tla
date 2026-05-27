@@ -53,18 +53,7 @@ RecoverChoiceByRand(vvdCfg, r, ct, choices) ==
   THEN CHOOSE c \in choices : EGEnc(epk, c, r) = ct
   ELSE NoStr
 
-LatestVoteForVoter(ballotStore, voterId) ==
-  IF VoteVidsForVoter(ballotStore, voterId) # {}
-  THEN LET latestVid ==
-             CHOOSE v \in VoteVidsForVoter(ballotStore, voterId) :
-               \A other \in VoteVidsForVoter(ballotStore, voterId) :
-                 \/ ballotStore[v].tsp.t > ballotStore[other].tsp.t
-                 \/ /\ ballotStore[v].tsp.t = ballotStore[other].tsp.t
-                    /\ v >= other
-       IN LatestVote(latestVid, ballotStore[latestVid].tsp.t)
-  ELSE EmptyLatestVote
-
-FreshSessionCtx(req) == SessionCtx(req.authChallenge, req.csAuthTokNonce, req.issuedVid, Empty, NoInt, NoTSPReq, NoOCSPReq, NoInt)
+FreshSessionCtx(req) == SessionCtx(req.authChallenge, req.csAuthTokNonce, req.issuedVid, Empty, NoInt, NoInt, EmptyBDOC, NoTSPReq, NoOCSPReq, NoTSPRes, NoOCSPRes, NoInt)
 
 ActiveVoteSessionSids(sessionStore) ==
   { sid \in DOMAIN sessionStore :
@@ -115,7 +104,8 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     chVCDToVVD = NoMsg,
     chVVDToCS = NoMsg,
     chCSToVVD = NoMsg,
-    chVVDToVoter = NoMsg;
+    chVVDToVoter = NoMsg,
+    chVoterToVVD = NoMsg;
 
   (* This process captures the voter's actions in the voting phase *)
   fair process (VoterProc = VoterPid)
@@ -173,7 +163,24 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     chVoterToVCD := VoterToVCD("StartVerify", NoBody);
     chVCDToVoter := NoMsg;
 
+  Voter_ApproveDecrypt:
+    await chVVDToVoter.tag = "VerifyPreDecryptDisplay" \/ chVVDToVoter.tag = "VerifyFailed";
+    assert voterPhase = "VerifyPending";
+    if (chVVDToVoter.tag = "VerifyPreDecryptDisplay") {
+      assert chVVDToVoter.body.payload.pnoee = ScenarioVoterProfile(scenarioIdx).voterId;
+      chVoterToVVD := VoterToVVD("ApproveDecrypt", NoBody);
+    } else {
+      accepted := FALSE;
+      voterAccept := NoStr;
+      voterPhase := "Verified";
+      chVoterToVVD := VoterToVVD("RejectDecrypt", NoBody);
+    };
+    chVVDToVoter := NoMsg;
+
   Voter_VerifyBallot:
+    if (voterPhase = "Verified") {
+      skip;
+    } else {
     await chVVDToVoter.tag = "VerifyDisplay" \/ chVVDToVoter.tag = "VerifyFailed";
     assert voterPhase = "VerifyPending";
     if (chVVDToVoter.tag = "VerifyDisplay") {
@@ -193,6 +200,7 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
       };
     };
     chVVDToVoter := NoMsg;
+    };
 
   Voter_Done:
     if (voterScenarioIdx < Len(VotingScenario)) {
@@ -339,7 +347,6 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     csScenarioIdx = 1,
     csSessionStore = EmptySessionStore,
     csBallotStore = EmptyCSBallotStore,
-    csLatest = EmptyLatestVote,
     csDroppedBallot = FALSE,
 			csReqCnt = 0,
 			csFreshnessStore = CSFreshnessStore,
@@ -390,7 +397,10 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
 				with (tok = CreateAuthToken(CSSymKey, cert, session.ctx.issuedVid, session.ctx.authTokNonce)) {
 				csSessionStore := StorePut(csSessionStore,
 																		chProviderToCS.body.sidCS,
-																		[session EXCEPT !.phase = "AuthStatus", !.tok = tok, !.exp = PhaseAuthStatusTime + csCfg.stageTTL]);
+																		[session EXCEPT !.phase = "AuthStatus",
+                                                            !.voterId = cert.pnoee,
+                                                            !.tok = tok,
+                                                            !.exp = PhaseAuthStatusTime + csCfg.stageTTL]);
 				chCSToVCD := CSToVCD("AuthStatusRes", chProviderToCS.body.sidCS, NoInt, tok);
 			};
 		};
@@ -481,12 +491,13 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
                 tspReq = LET h == Hash(p.bdoc.sig) IN TSPReq(h, Sign(TSPClientSK, h)),
                 ocspReq = OCSPReq(p.bdoc.signerCert),
                 session = [upd.session EXCEPT !.ctx.voteVid = voteVid,
-                                               !.ctx.tspReq = LET h == Hash(p.bdoc.sig) IN TSPReq(h, Sign(TSPClientSK, h)),
-                                               !.ctx.ocspReq = OCSPReq(p.bdoc.signerCert)]) {
+                                               !.ctx.submitted = t,
+                                               !.ctx.bdoc = p.bdoc,
+                                               !.ctx.tspReq = tspReq,
+                                               !.ctx.ocspReq = ocspReq,
+                                               !.ctx.tspRes = NoTSPRes,
+                                               !.ctx.ocspRes = NoOCSPRes]) {
             csSessionStore := StorePut(upd.store, chVCDToCS.body.sidCS, session);
-			      csBallotStore := StorePut(csBallotStore,
-                                    voteVid,
-                                    StoredVote(voteVid, upd.session.voterId, t, p.bdoc, NoTSPRes, NoOCSPRes, 0));
           };
 		  };
     };
@@ -507,7 +518,9 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
       assert sid # Empty;
       assert session # Empty;
       assert VerifyTSPCS(csCfg, session.ctx.tspReq, chRegToCS.body.payload, t);
-      csBallotStore := [csBallotStore EXCEPT ![session.ctx.voteVid].tsp = chRegToCS.body.payload];
+      csSessionStore := StorePut(csSessionStore,
+                                 sid,
+                                 [session EXCEPT !.ctx.tspRes = chRegToCS.body.payload]);
     };
     chRegToCS := NoMsg;
 
@@ -523,18 +536,24 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     await chRegToCS.tag = "OCSPRes";
     with (t = PhaseOCSPTime,
           sid = ActiveVoteSessionSid(csSessionStore),
-          session = StoreLookup(csSessionStore, ActiveVoteSessionSid(csSessionStore)),
-          ballot = StoreLookup(csBallotStore, StoreLookup(csSessionStore, ActiveVoteSessionSid(csSessionStore)).ctx.voteVid)) {
+          session = StoreLookup(csSessionStore, ActiveVoteSessionSid(csSessionStore))) {
       assert sid # Empty;
       assert session # Empty;
-      assert ballot # Empty;
+      assert session.ctx.tspRes # NoTSPRes;
       assert VerifyOCSPCS(csCfg, session.ctx.ocspReq, chRegToCS.body.payload);
-      assert chRegToCS.body.payload.t >= ballot.tsp.t;
-      with (updatedStore = StorePut(csBallotStore,
-                                    session.ctx.voteVid,
-                                    [ballot EXCEPT !.ocsp = chRegToCS.body.payload])) {
-        csBallotStore := updatedStore;
-        csLatest := LatestVoteForVoter(updatedStore, ballot.voterId);
+      assert chRegToCS.body.payload.t >= session.ctx.tspRes.t;
+      with (ballot = RegisteredBallot(session.ctx.voteVid,
+                                      session.voterId,
+                                      session.ctx.submitted,
+                                      session.ctx.tspRes.t,
+                                      session.ctx.bdoc,
+                                      session.ctx.tspRes,
+                                      chRegToCS.body.payload,
+                                      0,
+                                      FALSE),
+            updatedSession = [session EXCEPT !.ctx.ocspRes = chRegToCS.body.payload]) {
+        csSessionStore := StorePut(csSessionStore, sid, updatedSession);
+        csBallotStore := StorePut(csBallotStore, session.ctx.voteVid, ballot);
       };
     };
     chRegToCS := NoMsg;
@@ -554,10 +573,12 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     await chVVDToCS.tag = "VerifyReq";
     with (t = PhaseVerifyTime,
           upd = VerifyAndUpdateSession(csCfg, csSessionStore, chVVDToCS.body.sidCS, "Verify", Empty, NoVoterRef, t),
-          ballot = StoreLookup(csBallotStore, chVVDToCS.body.vid)) {
+          ballot = StoreLookup(csBallotStore, chVVDToCS.body.vid),
+          latest = LET b == StoreLookup(csBallotStore, chVVDToCS.body.vid)
+                   IN IF b # Empty THEN LatestRegisteredBallot(csBallotStore, b.voterId) ELSE EmptyRegisteredBallot) {
       if (/\ upd.ok
           /\ ballot # Empty
-          /\ chVVDToCS.body.vid = csLatest.vid
+          /\ chVVDToCS.body.vid = latest.vid
           /\ ballot.verCount < csCfg.verifyCountLimit
           /\ t <= ballot.submitted + csCfg.verifyWindow
           /\ ballot.tsp # NoTSPRes
@@ -576,16 +597,17 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
       either {
         skip;
       } or {
-        if (/\ csLatest.vid # NoInt /\ csLatest.vid \in DOMAIN csBallotStore) {
-          with (ballot = StoreLookup(csBallotStore, csLatest.vid),
-                updatedStore = StoreDelete(csBallotStore, csLatest.vid)) {
-            assert ballot # Empty;
+        with (anyVid = IF DOMAIN csBallotStore # {} THEN CHOOSE v \in DOMAIN csBallotStore : TRUE ELSE NoInt) {
+        if (anyVid # NoInt) {
+          with (latest = LatestRegisteredBallot(csBallotStore, StoreLookup(csBallotStore, anyVid).voterId),
+                updatedStore = StoreDelete(csBallotStore, LatestRegisteredBallot(csBallotStore, StoreLookup(csBallotStore, anyVid).voterId).vid)) {
+            assert latest # EmptyRegisteredBallot;
             csBallotStore := updatedStore;
-            csLatest := LatestVoteForVoter(updatedStore, ballot.voterId);
           };
           csDroppedBallot := TRUE;
         } else {
           skip;
+        };
         };
       };
     } else {
@@ -596,7 +618,6 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     if (csScenarioIdx < Len(VotingScenario)) {
       await scenarioIdx > csScenarioIdx;
       csScenarioIdx := scenarioIdx;
-      csLatest := EmptyLatestVote;
       goto CS_RecvAuthReq;
     } else {
       skip;
@@ -822,6 +843,8 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     vvdVid = NoInt,
     vvdRand = Empty,
     vvdChoice = NoStr,
+    vvdPendingBdoc = EmptyBDOC,
+    vvdPendingChoices = {},
     vvdAccepted = FALSE,
     vvdRejected = FALSE;
 		vvdCfg = ExpectedPublicConfig;
@@ -834,19 +857,35 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
     chVVDToCS := VVDToCS("VerifyReq", vvdSidCS, vvdVid);
     chVCDToVVD := NoMsg;
 
-  VVD_RecvVerifyRes: \* verify signature, tsp, ocsp, then try decrypt
+  VVD_RecvVerifyRes: \* verify signature, tsp, ocsp, then display pre-decryption ballot metadata
     await chCSToVVD.tag = "VerifyRes";
   	with (p = chCSToVVD.body.payload) {
-				if (/\ ValidateBallot(vvdCfg, p.bdoc, p.tsp, p.ocsp, p.choices) /\ RecoverChoiceByRand(vvdCfg, vvdRand, p.bdoc.ct, p.choices) # NoStr) {
-					vvdChoice := RecoverChoiceByRand(vvdCfg, vvdRand, p.bdoc.ct, p.choices);
-					vvdAccepted := TRUE;
-					chVVDToVoter := VVDToVoter("VerifyDisplay", [choice |-> vvdChoice, bdoc |-> p.bdoc]);
+				if (ValidateBallot(vvdCfg, p.bdoc, p.tsp, p.ocsp, p.choices)) {
+          vvdPendingBdoc := p.bdoc;
+          vvdPendingChoices := p.choices;
+					chVVDToVoter := VVDToVoter("VerifyPreDecryptDisplay", [bdoc |-> p.bdoc, ct |-> p.bdoc.ct, pnoee |-> p.bdoc.signerCert.pnoee]);
 				} else {
 					vvdRejected := TRUE;
 					chVVDToVoter := VVDToVoter("VerifyFailed", NoBody);
 				};
 				chCSToVVD := NoMsg;
 			};
+
+  VVD_RecvDecryptApproval:
+    await chVoterToVVD.tag = "ApproveDecrypt" \/ chVoterToVVD.tag = "RejectDecrypt";
+    if (chVoterToVVD.tag = "ApproveDecrypt") {
+      if (RecoverChoiceByRand(vvdCfg, vvdRand, vvdPendingBdoc.ct, vvdPendingChoices) # NoStr) {
+        vvdChoice := RecoverChoiceByRand(vvdCfg, vvdRand, vvdPendingBdoc.ct, vvdPendingChoices);
+        vvdAccepted := TRUE;
+        chVVDToVoter := VVDToVoter("VerifyDisplay", [choice |-> vvdChoice, bdoc |-> vvdPendingBdoc]);
+      } else {
+        vvdRejected := TRUE;
+        chVVDToVoter := VVDToVoter("VerifyFailed", NoBody);
+      };
+    } else {
+      skip;
+    };
+    chVoterToVVD := NoMsg;
 
   VVD_Done:
     if (vvdScenarioIdx < Len(VotingScenario)) {
@@ -856,6 +895,8 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
       vvdVid := NoInt;
       vvdRand := Empty;
       vvdChoice := NoStr;
+      vvdPendingBdoc := EmptyBDOC;
+      vvdPendingChoices := {};
       vvdAccepted := FALSE;
       vvdRejected := FALSE;
       goto VVD_RecvQR;
@@ -866,38 +907,37 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
 }
 end algorithm; *)
 
-(* We now begin to enode various properties and invariants for the code above *)
-
-\* BEGIN TRANSLATION (chksum(pcal) = "293469ce" /\ chksum(tla) = "5a418d82")
+\* BEGIN TRANSLATION (chksum(pcal) = "791735d1" /\ chksum(tla) = "d2f6611f")
 VARIABLES pc, scenarioIdx, chVoterToVCD, chVCDToVoter, chVCDToCS, chCSToVCD, 
           chCSToProvider, chProviderToCS, chProviderToSign, chSignToProvider, 
           chSignToVoter, chVoterToSign, chCSToReg, chRegToCS, chVCDToVVD, 
-          chVVDToCS, chCSToVVD, chVVDToVoter, voterScenarioIdx, voterPhase, 
-          voterChoice, accepted, voterAccept, verifiedBDOCs, vcdScenarioIdx, 
-          vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
-          csScenarioIdx, csSessionStore, csBallotStore, csLatest, 
+          chVVDToCS, chCSToVVD, chVVDToVoter, chVoterToVVD, voterScenarioIdx, 
+          voterPhase, voterChoice, accepted, voterAccept, verifiedBDOCs, 
+          vcdScenarioIdx, vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+          vcdVoteRes, vcdCfg, csScenarioIdx, csSessionStore, csBallotStore, 
           csDroppedBallot, csReqCnt, csFreshnessStore, csCfg, 
           providerScenarioIdx, providerSessionStore, providerCertStore, 
           provAuthSid, provSignSid, signScenarioIdx, signAuthChallenge, 
           authPhone, signChallenge, signPhone, regScenarioIdx, regStore, 
           regNextIdx, regOcspStore, regNextOCSPIdx, regDroppedLogEntry, 
-          vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-          vvdRejected, vvdCfg
+          vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+          vvdPendingBdoc, vvdPendingChoices, vvdAccepted, vvdRejected, vvdCfg
 
 vars == << pc, scenarioIdx, chVoterToVCD, chVCDToVoter, chVCDToCS, chCSToVCD, 
            chCSToProvider, chProviderToCS, chProviderToSign, chSignToProvider, 
            chSignToVoter, chVoterToSign, chCSToReg, chRegToCS, chVCDToVVD, 
-           chVVDToCS, chCSToVVD, chVVDToVoter, voterScenarioIdx, voterPhase, 
-           voterChoice, accepted, voterAccept, verifiedBDOCs, vcdScenarioIdx, 
-           vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
-           csScenarioIdx, csSessionStore, csBallotStore, csLatest, 
+           chVVDToCS, chCSToVVD, chVVDToVoter, chVoterToVVD, voterScenarioIdx, 
+           voterPhase, voterChoice, accepted, voterAccept, verifiedBDOCs, 
+           vcdScenarioIdx, vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+           vcdVoteRes, vcdCfg, csScenarioIdx, csSessionStore, csBallotStore, 
            csDroppedBallot, csReqCnt, csFreshnessStore, csCfg, 
            providerScenarioIdx, providerSessionStore, providerCertStore, 
            provAuthSid, provSignSid, signScenarioIdx, signAuthChallenge, 
            authPhone, signChallenge, signPhone, regScenarioIdx, regStore, 
            regNextIdx, regOcspStore, regNextOCSPIdx, regDroppedLogEntry, 
-           vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-           vvdRejected, vvdCfg >>
+           vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+           vvdPendingBdoc, vvdPendingChoices, vvdAccepted, vvdRejected, 
+           vvdCfg >>
 
 ProcSet == {VoterPid} \cup {VCDPid} \cup {CSPid} \cup {ProviderPid} \cup {SignPid} \cup {RegPid} \cup {VVDPid}
 
@@ -919,6 +959,7 @@ Init == (* Global variables *)
         /\ chVVDToCS = NoMsg
         /\ chCSToVVD = NoMsg
         /\ chVVDToVoter = NoMsg
+        /\ chVoterToVVD = NoMsg
         (* Process VoterProc *)
         /\ voterScenarioIdx = 1
         /\ voterPhase = "Idle"
@@ -938,7 +979,6 @@ Init == (* Global variables *)
         /\ csScenarioIdx = 1
         /\ csSessionStore = EmptySessionStore
         /\ csBallotStore = EmptyCSBallotStore
-        /\ csLatest = EmptyLatestVote
         /\ csDroppedBallot = FALSE
         /\ csReqCnt = 0
         /\ csFreshnessStore = CSFreshnessStore
@@ -968,6 +1008,8 @@ Init == (* Global variables *)
         /\ vvdVid = NoInt
         /\ vvdRand = Empty
         /\ vvdChoice = NoStr
+        /\ vvdPendingBdoc = EmptyBDOC
+        /\ vvdPendingChoices = {}
         /\ vvdAccepted = FALSE
         /\ vvdRejected = FALSE
         /\ vvdCfg = ExpectedPublicConfig
@@ -981,7 +1023,7 @@ Init == (* Global variables *)
 
 Voter_StartVoting == /\ pc[VoterPid] = "Voter_StartVoting"
                      /\ Assert(VoterCanAdvance(voterPhase, "AuthPending"), 
-                               "Failure of assertion at line 130, column 5.")
+                               "Failure of assertion at line 122, column 5.")
                      /\ chVoterToVCD' = VoterToVCD("StartVoting", ScenarioVoterProfile(scenarioIdx))
                      /\ voterPhase' = "AuthPending"
                      /\ pc' = [pc EXCEPT ![VoterPid] = "Voter_ApproveAuth"]
@@ -990,13 +1032,13 @@ Voter_StartVoting == /\ pc[VoterPid] = "Voter_StartVoting"
                                      chProviderToSign, chSignToProvider, 
                                      chSignToVoter, chVoterToSign, chCSToReg, 
                                      chRegToCS, chVCDToVVD, chVVDToCS, 
-                                     chCSToVVD, chVVDToVoter, voterScenarioIdx, 
-                                     voterChoice, accepted, voterAccept, 
-                                     verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                     vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                     vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                     csSessionStore, csBallotStore, csLatest, 
-                                     csDroppedBallot, csReqCnt, 
+                                     chCSToVVD, chVVDToVoter, chVoterToVVD, 
+                                     voterScenarioIdx, voterChoice, accepted, 
+                                     voterAccept, verifiedBDOCs, 
+                                     vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                     vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                     vcdCfg, csScenarioIdx, csSessionStore, 
+                                     csBallotStore, csDroppedBallot, csReqCnt, 
                                      csFreshnessStore, csCfg, 
                                      providerScenarioIdx, providerSessionStore, 
                                      providerCertStore, provAuthSid, 
@@ -1006,15 +1048,16 @@ Voter_StartVoting == /\ pc[VoterPid] = "Voter_StartVoting"
                                      regStore, regNextIdx, regOcspStore, 
                                      regNextOCSPIdx, regDroppedLogEntry, 
                                      vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                                     vvdChoice, vvdAccepted, vvdRejected, 
-                                     vvdCfg >>
+                                     vvdChoice, vvdPendingBdoc, 
+                                     vvdPendingChoices, vvdAccepted, 
+                                     vvdRejected, vvdCfg >>
 
 Voter_ApproveAuth == /\ pc[VoterPid] = "Voter_ApproveAuth"
                      /\ chVCDToVoter.tag = "AuthChallengeDisplay" /\ chSignToVoter.tag = "AuthChallengeDisplay"
                      /\ Assert(voterPhase = "AuthPending", 
-                               "Failure of assertion at line 136, column 5.")
+                               "Failure of assertion at line 128, column 5.")
                      /\ Assert(chVCDToVoter.body.payload.challenge = chSignToVoter.body.payload.challenge, 
-                               "Failure of assertion at line 137, column 5.")
+                               "Failure of assertion at line 129, column 5.")
                      /\ chVoterToVCD' = VoterToVCD("ApproveAuth", NoBody)
                      /\ chVoterToSign' = VoterToSign("ApproveAuth", NoBody)
                      /\ voterPhase' = "ChoicePending"
@@ -1026,13 +1069,14 @@ Voter_ApproveAuth == /\ pc[VoterPid] = "Voter_ApproveAuth"
                                      chProviderToSign, chSignToProvider, 
                                      chCSToReg, chRegToCS, chVCDToVVD, 
                                      chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                     voterScenarioIdx, voterChoice, accepted, 
-                                     voterAccept, verifiedBDOCs, 
-                                     vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                     vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
-                                     vcdCfg, csScenarioIdx, csSessionStore, 
-                                     csBallotStore, csLatest, csDroppedBallot, 
-                                     csReqCnt, csFreshnessStore, csCfg, 
+                                     chVoterToVVD, voterScenarioIdx, 
+                                     voterChoice, accepted, voterAccept, 
+                                     verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                     vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                     vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                     csSessionStore, csBallotStore, 
+                                     csDroppedBallot, csReqCnt, 
+                                     csFreshnessStore, csCfg, 
                                      providerScenarioIdx, providerSessionStore, 
                                      providerCertStore, provAuthSid, 
                                      provSignSid, signScenarioIdx, 
@@ -1041,20 +1085,21 @@ Voter_ApproveAuth == /\ pc[VoterPid] = "Voter_ApproveAuth"
                                      regStore, regNextIdx, regOcspStore, 
                                      regNextOCSPIdx, regDroppedLogEntry, 
                                      vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                                     vvdChoice, vvdAccepted, vvdRejected, 
-                                     vvdCfg >>
+                                     vvdChoice, vvdPendingBdoc, 
+                                     vvdPendingChoices, vvdAccepted, 
+                                     vvdRejected, vvdCfg >>
 
 Voter_ChooseChoice == /\ pc[VoterPid] = "Voter_ChooseChoice"
                       /\ chVCDToVoter.tag = "ChoicesDisplay"
                       /\ Assert(voterPhase = "ChoicePending", 
-                                "Failure of assertion at line 146, column 5.")
+                                "Failure of assertion at line 138, column 5.")
                       /\ LET c == ScenarioChoice(scenarioIdx) IN
                            /\ Assert(c \in chVCDToVoter.body.payload, 
-                                     "Failure of assertion at line 148, column 7.")
+                                     "Failure of assertion at line 140, column 7.")
                            /\ voterChoice' = c
                            /\ chVoterToVCD' = VoterToVCD("Choose", c)
                       /\ Assert(VoterCanAdvance(voterPhase, "SignPending"), 
-                                "Failure of assertion at line 152, column 5.")
+                                "Failure of assertion at line 144, column 5.")
                       /\ voterPhase' = "SignPending"
                       /\ chVCDToVoter' = NoMsg
                       /\ pc' = [pc EXCEPT ![VoterPid] = "Voter_ApproveSign"]
@@ -1063,12 +1108,12 @@ Voter_ChooseChoice == /\ pc[VoterPid] = "Voter_ChooseChoice"
                                       chProviderToSign, chSignToProvider, 
                                       chSignToVoter, chVoterToSign, chCSToReg, 
                                       chRegToCS, chVCDToVVD, chVVDToCS, 
-                                      chCSToVVD, chVVDToVoter, 
+                                      chCSToVVD, chVVDToVoter, chVoterToVVD, 
                                       voterScenarioIdx, accepted, voterAccept, 
                                       verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
                                       vcdChoice, vcdVoteBDOC, vcdVoteReq, 
                                       vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                      csSessionStore, csBallotStore, csLatest, 
+                                      csSessionStore, csBallotStore, 
                                       csDroppedBallot, csReqCnt, 
                                       csFreshnessStore, csCfg, 
                                       providerScenarioIdx, 
@@ -1080,20 +1125,21 @@ Voter_ChooseChoice == /\ pc[VoterPid] = "Voter_ChooseChoice"
                                       regOcspStore, regNextOCSPIdx, 
                                       regDroppedLogEntry, vvdScenarioIdx, 
                                       vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                      vvdPendingBdoc, vvdPendingChoices, 
                                       vvdAccepted, vvdRejected, vvdCfg >>
 
 Voter_ApproveSign == /\ pc[VoterPid] = "Voter_ApproveSign"
                      /\ /\ chVCDToVoter.tag = "SignChallengeDisplay" /\ chSignToVoter.tag = "SignChallengeDisplay"
                      /\ Assert(voterPhase = "SignPending", 
-                               "Failure of assertion at line 158, column 5.")
+                               "Failure of assertion at line 150, column 5.")
                      /\ Assert(voterChoice # NoStr, 
-                               "Failure of assertion at line 159, column 5.")
+                               "Failure of assertion at line 151, column 5.")
                      /\ Assert(chVCDToVoter.body.payload.challenge = chSignToVoter.body.payload.challenge, 
-                               "Failure of assertion at line 160, column 5.")
+                               "Failure of assertion at line 152, column 5.")
                      /\ chVoterToVCD' = VoterToVCD("ApproveSign", NoBody)
                      /\ chVoterToSign' = VoterToSign("ApproveSign", NoBody)
                      /\ Assert(VoterCanAdvance(voterPhase, "VerifyPending"), 
-                               "Failure of assertion at line 163, column 5.")
+                               "Failure of assertion at line 155, column 5.")
                      /\ voterPhase' = "VerifyPending"
                      /\ chVCDToVoter' = NoMsg
                      /\ chSignToVoter' = NoMsg
@@ -1103,13 +1149,14 @@ Voter_ApproveSign == /\ pc[VoterPid] = "Voter_ApproveSign"
                                      chProviderToSign, chSignToProvider, 
                                      chCSToReg, chRegToCS, chVCDToVVD, 
                                      chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                     voterScenarioIdx, voterChoice, accepted, 
-                                     voterAccept, verifiedBDOCs, 
-                                     vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                     vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
-                                     vcdCfg, csScenarioIdx, csSessionStore, 
-                                     csBallotStore, csLatest, csDroppedBallot, 
-                                     csReqCnt, csFreshnessStore, csCfg, 
+                                     chVoterToVVD, voterScenarioIdx, 
+                                     voterChoice, accepted, voterAccept, 
+                                     verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                     vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                     vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                     csSessionStore, csBallotStore, 
+                                     csDroppedBallot, csReqCnt, 
+                                     csFreshnessStore, csCfg, 
                                      providerScenarioIdx, providerSessionStore, 
                                      providerCertStore, provAuthSid, 
                                      provSignSid, signScenarioIdx, 
@@ -1118,58 +1165,108 @@ Voter_ApproveSign == /\ pc[VoterPid] = "Voter_ApproveSign"
                                      regStore, regNextIdx, regOcspStore, 
                                      regNextOCSPIdx, regDroppedLogEntry, 
                                      vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                                     vvdChoice, vvdAccepted, vvdRejected, 
-                                     vvdCfg >>
+                                     vvdChoice, vvdPendingBdoc, 
+                                     vvdPendingChoices, vvdAccepted, 
+                                     vvdRejected, vvdCfg >>
 
 Voter_VerifyReq == /\ pc[VoterPid] = "Voter_VerifyReq"
                    /\ chVCDToVoter.tag = "Voted"
                    /\ Assert(voterPhase = "VerifyPending", 
-                             "Failure of assertion at line 170, column 5.")
+                             "Failure of assertion at line 162, column 5.")
                    /\ chVoterToVCD' = VoterToVCD("StartVerify", NoBody)
                    /\ chVCDToVoter' = NoMsg
-                   /\ pc' = [pc EXCEPT ![VoterPid] = "Voter_VerifyBallot"]
+                   /\ pc' = [pc EXCEPT ![VoterPid] = "Voter_ApproveDecrypt"]
                    /\ UNCHANGED << scenarioIdx, chVCDToCS, chCSToVCD, 
                                    chCSToProvider, chProviderToCS, 
                                    chProviderToSign, chSignToProvider, 
                                    chSignToVoter, chVoterToSign, chCSToReg, 
                                    chRegToCS, chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                   chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                   voterChoice, accepted, voterAccept, 
-                                   verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                   vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                   vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                   csSessionStore, csBallotStore, csLatest, 
-                                   csDroppedBallot, csReqCnt, csFreshnessStore, 
-                                   csCfg, providerScenarioIdx, 
-                                   providerSessionStore, providerCertStore, 
-                                   provAuthSid, provSignSid, signScenarioIdx, 
-                                   signAuthChallenge, authPhone, signChallenge, 
-                                   signPhone, regScenarioIdx, regStore, 
-                                   regNextIdx, regOcspStore, regNextOCSPIdx, 
+                                   chVVDToVoter, chVoterToVVD, 
+                                   voterScenarioIdx, voterPhase, voterChoice, 
+                                   accepted, voterAccept, verifiedBDOCs, 
+                                   vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                   vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
+                                   csScenarioIdx, csSessionStore, 
+                                   csBallotStore, csDroppedBallot, csReqCnt, 
+                                   csFreshnessStore, csCfg, 
+                                   providerScenarioIdx, providerSessionStore, 
+                                   providerCertStore, provAuthSid, provSignSid, 
+                                   signScenarioIdx, signAuthChallenge, 
+                                   authPhone, signChallenge, signPhone, 
+                                   regScenarioIdx, regStore, regNextIdx, 
+                                   regOcspStore, regNextOCSPIdx, 
                                    regDroppedLogEntry, vvdScenarioIdx, 
                                    vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                   vvdPendingBdoc, vvdPendingChoices, 
                                    vvdAccepted, vvdRejected, vvdCfg >>
 
+Voter_ApproveDecrypt == /\ pc[VoterPid] = "Voter_ApproveDecrypt"
+                        /\ chVVDToVoter.tag = "VerifyPreDecryptDisplay" \/ chVVDToVoter.tag = "VerifyFailed"
+                        /\ Assert(voterPhase = "VerifyPending", 
+                                  "Failure of assertion at line 168, column 5.")
+                        /\ IF chVVDToVoter.tag = "VerifyPreDecryptDisplay"
+                              THEN /\ Assert(chVVDToVoter.body.payload.pnoee = ScenarioVoterProfile(scenarioIdx).voterId, 
+                                             "Failure of assertion at line 170, column 7.")
+                                   /\ chVoterToVVD' = VoterToVVD("ApproveDecrypt", NoBody)
+                                   /\ UNCHANGED << voterPhase, accepted, 
+                                                   voterAccept >>
+                              ELSE /\ accepted' = FALSE
+                                   /\ voterAccept' = NoStr
+                                   /\ voterPhase' = "Verified"
+                                   /\ chVoterToVVD' = VoterToVVD("RejectDecrypt", NoBody)
+                        /\ chVVDToVoter' = NoMsg
+                        /\ pc' = [pc EXCEPT ![VoterPid] = "Voter_VerifyBallot"]
+                        /\ UNCHANGED << scenarioIdx, chVoterToVCD, 
+                                        chVCDToVoter, chVCDToCS, chCSToVCD, 
+                                        chCSToProvider, chProviderToCS, 
+                                        chProviderToSign, chSignToProvider, 
+                                        chSignToVoter, chVoterToSign, 
+                                        chCSToReg, chRegToCS, chVCDToVVD, 
+                                        chVVDToCS, chCSToVVD, voterScenarioIdx, 
+                                        voterChoice, verifiedBDOCs, 
+                                        vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                        vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                        vcdCfg, csScenarioIdx, csSessionStore, 
+                                        csBallotStore, csDroppedBallot, 
+                                        csReqCnt, csFreshnessStore, csCfg, 
+                                        providerScenarioIdx, 
+                                        providerSessionStore, 
+                                        providerCertStore, provAuthSid, 
+                                        provSignSid, signScenarioIdx, 
+                                        signAuthChallenge, authPhone, 
+                                        signChallenge, signPhone, 
+                                        regScenarioIdx, regStore, regNextIdx, 
+                                        regOcspStore, regNextOCSPIdx, 
+                                        regDroppedLogEntry, vvdScenarioIdx, 
+                                        vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                        vvdPendingBdoc, vvdPendingChoices, 
+                                        vvdAccepted, vvdRejected, vvdCfg >>
+
 Voter_VerifyBallot == /\ pc[VoterPid] = "Voter_VerifyBallot"
-                      /\ chVVDToVoter.tag = "VerifyDisplay" \/ chVVDToVoter.tag = "VerifyFailed"
-                      /\ Assert(voterPhase = "VerifyPending", 
-                                "Failure of assertion at line 176, column 5.")
-                      /\ IF chVVDToVoter.tag = "VerifyDisplay"
-                            THEN /\ Assert(chVVDToVoter.body.payload.choice = voterChoice, 
-                                           "Failure of assertion at line 178, column 7.")
-                                 /\ Assert(VoterCanAdvance(voterPhase, "Verified"), 
-                                           "Failure of assertion at line 179, column 7.")
-                                 /\ accepted' = TRUE
-                                 /\ voterAccept' = chVVDToVoter.body.payload.choice
-                                 /\ voterPhase' = "Verified"
-                                 /\ verifiedBDOCs' = (verifiedBDOCs \cup {chVVDToVoter.body.payload.bdoc})
-                            ELSE /\ accepted' = FALSE
-                                 /\ voterAccept' = NoStr
-                                 /\ IF chVVDToVoter.tag = "VerifyFailed"
-                                       THEN /\ voterPhase' = "Verified"
-                                       ELSE /\ voterPhase' = "Verified"
-                                 /\ UNCHANGED verifiedBDOCs
-                      /\ chVVDToVoter' = NoMsg
+                      /\ IF voterPhase = "Verified"
+                            THEN /\ TRUE
+                                 /\ UNCHANGED << chVVDToVoter, voterPhase, 
+                                                 accepted, voterAccept, 
+                                                 verifiedBDOCs >>
+                            ELSE /\ chVVDToVoter.tag = "VerifyDisplay" \/ chVVDToVoter.tag = "VerifyFailed"
+                                 /\ Assert(voterPhase = "VerifyPending", 
+                                           "Failure of assertion at line 185, column 5.")
+                                 /\ IF chVVDToVoter.tag = "VerifyDisplay"
+                                       THEN /\ Assert(chVVDToVoter.body.payload.choice = voterChoice, 
+                                                      "Failure of assertion at line 187, column 7.")
+                                            /\ Assert(VoterCanAdvance(voterPhase, "Verified"), 
+                                                      "Failure of assertion at line 188, column 7.")
+                                            /\ accepted' = TRUE
+                                            /\ voterAccept' = chVVDToVoter.body.payload.choice
+                                            /\ voterPhase' = "Verified"
+                                            /\ verifiedBDOCs' = (verifiedBDOCs \cup {chVVDToVoter.body.payload.bdoc})
+                                       ELSE /\ accepted' = FALSE
+                                            /\ voterAccept' = NoStr
+                                            /\ IF chVVDToVoter.tag = "VerifyFailed"
+                                                  THEN /\ voterPhase' = "Verified"
+                                                  ELSE /\ voterPhase' = "Verified"
+                                            /\ UNCHANGED verifiedBDOCs
+                                 /\ chVVDToVoter' = NoMsg
                       /\ pc' = [pc EXCEPT ![VoterPid] = "Voter_Done"]
                       /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, 
                                       chVCDToCS, chCSToVCD, chCSToProvider, 
@@ -1177,12 +1274,13 @@ Voter_VerifyBallot == /\ pc[VoterPid] = "Voter_VerifyBallot"
                                       chSignToProvider, chSignToVoter, 
                                       chVoterToSign, chCSToReg, chRegToCS, 
                                       chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                      voterScenarioIdx, voterChoice, 
-                                      vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                      vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
-                                      vcdCfg, csScenarioIdx, csSessionStore, 
-                                      csBallotStore, csLatest, csDroppedBallot, 
-                                      csReqCnt, csFreshnessStore, csCfg, 
+                                      chVoterToVVD, voterScenarioIdx, 
+                                      voterChoice, vcdScenarioIdx, vcdCtx, 
+                                      vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                      vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                      csSessionStore, csBallotStore, 
+                                      csDroppedBallot, csReqCnt, 
+                                      csFreshnessStore, csCfg, 
                                       providerScenarioIdx, 
                                       providerSessionStore, providerCertStore, 
                                       provAuthSid, provSignSid, 
@@ -1192,6 +1290,7 @@ Voter_VerifyBallot == /\ pc[VoterPid] = "Voter_VerifyBallot"
                                       regOcspStore, regNextOCSPIdx, 
                                       regDroppedLogEntry, vvdScenarioIdx, 
                                       vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                      vvdPendingBdoc, vvdPendingChoices, 
                                       vvdAccepted, vvdRejected, vvdCfg >>
 
 Voter_Done == /\ pc[VoterPid] = "Voter_Done"
@@ -1218,10 +1317,10 @@ Voter_Done == /\ pc[VoterPid] = "Voter_Done"
                               chCSToProvider, chProviderToCS, chProviderToSign, 
                               chSignToProvider, chSignToVoter, chVoterToSign, 
                               chCSToReg, chRegToCS, chVCDToVVD, chVVDToCS, 
-                              chCSToVVD, chVVDToVoter, verifiedBDOCs, 
-                              vcdScenarioIdx, vcdCtx, vcdChoice, vcdVoteBDOC, 
-                              vcdVoteReq, vcdVoteRes, vcdCfg, csScenarioIdx, 
-                              csSessionStore, csBallotStore, csLatest, 
+                              chCSToVVD, chVVDToVoter, chVoterToVVD, 
+                              verifiedBDOCs, vcdScenarioIdx, vcdCtx, vcdChoice, 
+                              vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
+                              csScenarioIdx, csSessionStore, csBallotStore, 
                               csDroppedBallot, csReqCnt, csFreshnessStore, 
                               csCfg, providerScenarioIdx, providerSessionStore, 
                               providerCertStore, provAuthSid, provSignSid, 
@@ -1230,11 +1329,12 @@ Voter_Done == /\ pc[VoterPid] = "Voter_Done"
                               regStore, regNextIdx, regOcspStore, 
                               regNextOCSPIdx, regDroppedLogEntry, 
                               vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                              vvdChoice, vvdAccepted, vvdRejected, vvdCfg >>
+                              vvdChoice, vvdPendingBdoc, vvdPendingChoices, 
+                              vvdAccepted, vvdRejected, vvdCfg >>
 
 VoterProc == Voter_StartVoting \/ Voter_ApproveAuth \/ Voter_ChooseChoice
                 \/ Voter_ApproveSign \/ Voter_VerifyReq
-                \/ Voter_VerifyBallot \/ Voter_Done
+                \/ Voter_ApproveDecrypt \/ Voter_VerifyBallot \/ Voter_Done
 
 VCD_RecvStartVoting == /\ pc[VCDPid] = "VCD_RecvStartVoting"
                        /\ chVoterToVCD.tag = "StartVoting"
@@ -1246,13 +1346,13 @@ VCD_RecvStartVoting == /\ pc[VCDPid] = "VCD_RecvStartVoting"
                                        chProviderToSign, chSignToProvider, 
                                        chSignToVoter, chVoterToSign, chCSToReg, 
                                        chRegToCS, chVCDToVVD, chVVDToCS, 
-                                       chCSToVVD, chVVDToVoter, 
+                                       chCSToVVD, chVVDToVoter, chVoterToVVD, 
                                        voterScenarioIdx, voterPhase, 
                                        voterChoice, accepted, voterAccept, 
                                        verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
                                        vcdChoice, vcdVoteBDOC, vcdVoteReq, 
                                        vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                       csSessionStore, csBallotStore, csLatest, 
+                                       csSessionStore, csBallotStore, 
                                        csDroppedBallot, csReqCnt, 
                                        csFreshnessStore, csCfg, 
                                        providerScenarioIdx, 
@@ -1264,6 +1364,7 @@ VCD_RecvStartVoting == /\ pc[VCDPid] = "VCD_RecvStartVoting"
                                        regOcspStore, regNextOCSPIdx, 
                                        regDroppedLogEntry, vvdScenarioIdx, 
                                        vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                       vvdPendingBdoc, vvdPendingChoices, 
                                        vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_RecvAuthRes == /\ pc[VCDPid] = "VCD_RecvAuthRes"
@@ -1277,13 +1378,14 @@ VCD_RecvAuthRes == /\ pc[VCDPid] = "VCD_RecvAuthRes"
                                    chProviderToSign, chSignToProvider, 
                                    chSignToVoter, chVoterToSign, chCSToReg, 
                                    chRegToCS, chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                   chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                   voterChoice, accepted, voterAccept, 
-                                   verifiedBDOCs, vcdScenarioIdx, vcdChoice, 
-                                   vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
+                                   chVVDToVoter, chVoterToVVD, 
+                                   voterScenarioIdx, voterPhase, voterChoice, 
+                                   accepted, voterAccept, verifiedBDOCs, 
+                                   vcdScenarioIdx, vcdChoice, vcdVoteBDOC, 
+                                   vcdVoteReq, vcdVoteRes, vcdCfg, 
                                    csScenarioIdx, csSessionStore, 
-                                   csBallotStore, csLatest, csDroppedBallot, 
-                                   csReqCnt, csFreshnessStore, csCfg, 
+                                   csBallotStore, csDroppedBallot, csReqCnt, 
+                                   csFreshnessStore, csCfg, 
                                    providerScenarioIdx, providerSessionStore, 
                                    providerCertStore, provAuthSid, provSignSid, 
                                    signScenarioIdx, signAuthChallenge, 
@@ -1292,6 +1394,7 @@ VCD_RecvAuthRes == /\ pc[VCDPid] = "VCD_RecvAuthRes"
                                    regOcspStore, regNextOCSPIdx, 
                                    regDroppedLogEntry, vvdScenarioIdx, 
                                    vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                   vvdPendingBdoc, vvdPendingChoices, 
                                    vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_RecvAuthApproval == /\ pc[VCDPid] = "VCD_RecvAuthApproval"
@@ -1305,14 +1408,14 @@ VCD_RecvAuthApproval == /\ pc[VCDPid] = "VCD_RecvAuthApproval"
                                         chSignToVoter, chVoterToSign, 
                                         chCSToReg, chRegToCS, chVCDToVVD, 
                                         chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                        voterScenarioIdx, voterPhase, 
-                                        voterChoice, accepted, voterAccept, 
-                                        verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                        vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                        vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                        csSessionStore, csBallotStore, 
-                                        csLatest, csDroppedBallot, csReqCnt, 
-                                        csFreshnessStore, csCfg, 
+                                        chVoterToVVD, voterScenarioIdx, 
+                                        voterPhase, voterChoice, accepted, 
+                                        voterAccept, verifiedBDOCs, 
+                                        vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                        vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                        vcdCfg, csScenarioIdx, csSessionStore, 
+                                        csBallotStore, csDroppedBallot, 
+                                        csReqCnt, csFreshnessStore, csCfg, 
                                         providerScenarioIdx, 
                                         providerSessionStore, 
                                         providerCertStore, provAuthSid, 
@@ -1323,12 +1426,13 @@ VCD_RecvAuthApproval == /\ pc[VCDPid] = "VCD_RecvAuthApproval"
                                         regOcspStore, regNextOCSPIdx, 
                                         regDroppedLogEntry, vvdScenarioIdx, 
                                         vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                        vvdPendingBdoc, vvdPendingChoices, 
                                         vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_RecvAuthStatus == /\ pc[VCDPid] = "VCD_RecvAuthStatus"
                       /\ chCSToVCD.tag = "AuthStatusRes"
                       /\ Assert(chCSToVCD.body.sidCS = vcdCtx.sidCS, 
-                                "Failure of assertion at line 243, column 5.")
+                                "Failure of assertion at line 254, column 5.")
                       /\ vcdCtx' = [vcdCtx EXCEPT !.tok = chCSToVCD.body.payload]
                       /\ chCSToVCD' = NoMsg
                       /\ pc' = [pc EXCEPT ![VCDPid] = "VCD_SendChoicesReq"]
@@ -1338,14 +1442,14 @@ VCD_RecvAuthStatus == /\ pc[VCDPid] = "VCD_RecvAuthStatus"
                                       chSignToProvider, chSignToVoter, 
                                       chVoterToSign, chCSToReg, chRegToCS, 
                                       chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                      chVVDToVoter, voterScenarioIdx, 
-                                      voterPhase, voterChoice, accepted, 
-                                      voterAccept, verifiedBDOCs, 
-                                      vcdScenarioIdx, vcdChoice, vcdVoteBDOC, 
-                                      vcdVoteReq, vcdVoteRes, vcdCfg, 
-                                      csScenarioIdx, csSessionStore, 
-                                      csBallotStore, csLatest, csDroppedBallot, 
-                                      csReqCnt, csFreshnessStore, csCfg, 
+                                      chVVDToVoter, chVoterToVVD, 
+                                      voterScenarioIdx, voterPhase, 
+                                      voterChoice, accepted, voterAccept, 
+                                      verifiedBDOCs, vcdScenarioIdx, vcdChoice, 
+                                      vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                      vcdCfg, csScenarioIdx, csSessionStore, 
+                                      csBallotStore, csDroppedBallot, csReqCnt, 
+                                      csFreshnessStore, csCfg, 
                                       providerScenarioIdx, 
                                       providerSessionStore, providerCertStore, 
                                       provAuthSid, provSignSid, 
@@ -1355,6 +1459,7 @@ VCD_RecvAuthStatus == /\ pc[VCDPid] = "VCD_RecvAuthStatus"
                                       regOcspStore, regNextOCSPIdx, 
                                       regDroppedLogEntry, vvdScenarioIdx, 
                                       vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                      vvdPendingBdoc, vvdPendingChoices, 
                                       vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_SendChoicesReq == /\ pc[VCDPid] = "VCD_SendChoicesReq"
@@ -1366,14 +1471,15 @@ VCD_SendChoicesReq == /\ pc[VCDPid] = "VCD_SendChoicesReq"
                                       chSignToProvider, chSignToVoter, 
                                       chVoterToSign, chCSToReg, chRegToCS, 
                                       chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                      chVVDToVoter, voterScenarioIdx, 
-                                      voterPhase, voterChoice, accepted, 
-                                      voterAccept, verifiedBDOCs, 
-                                      vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                      vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
-                                      vcdCfg, csScenarioIdx, csSessionStore, 
-                                      csBallotStore, csLatest, csDroppedBallot, 
-                                      csReqCnt, csFreshnessStore, csCfg, 
+                                      chVVDToVoter, chVoterToVVD, 
+                                      voterScenarioIdx, voterPhase, 
+                                      voterChoice, accepted, voterAccept, 
+                                      verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                      vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                      vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                      csSessionStore, csBallotStore, 
+                                      csDroppedBallot, csReqCnt, 
+                                      csFreshnessStore, csCfg, 
                                       providerScenarioIdx, 
                                       providerSessionStore, providerCertStore, 
                                       provAuthSid, provSignSid, 
@@ -1383,12 +1489,13 @@ VCD_SendChoicesReq == /\ pc[VCDPid] = "VCD_SendChoicesReq"
                                       regOcspStore, regNextOCSPIdx, 
                                       regDroppedLogEntry, vvdScenarioIdx, 
                                       vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                      vvdPendingBdoc, vvdPendingChoices, 
                                       vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_RecvChoices == /\ pc[VCDPid] = "VCD_RecvChoices"
                    /\ chCSToVCD.tag = "ChoicesRes"
                    /\ Assert(chCSToVCD.body.sidCS = vcdCtx.sidCS, 
-                             "Failure of assertion at line 252, column 5.")
+                             "Failure of assertion at line 263, column 5.")
                    /\ vcdCtx' = [vcdCtx EXCEPT !.choices = chCSToVCD.body.payload]
                    /\ chVCDToVoter' = VCDToVoter("ChoicesDisplay", chCSToVCD.body.payload)
                    /\ chCSToVCD' = NoMsg
@@ -1398,13 +1505,14 @@ VCD_RecvChoices == /\ pc[VCDPid] = "VCD_RecvChoices"
                                    chProviderToSign, chSignToProvider, 
                                    chSignToVoter, chVoterToSign, chCSToReg, 
                                    chRegToCS, chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                   chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                   voterChoice, accepted, voterAccept, 
-                                   verifiedBDOCs, vcdScenarioIdx, vcdChoice, 
-                                   vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
+                                   chVVDToVoter, chVoterToVVD, 
+                                   voterScenarioIdx, voterPhase, voterChoice, 
+                                   accepted, voterAccept, verifiedBDOCs, 
+                                   vcdScenarioIdx, vcdChoice, vcdVoteBDOC, 
+                                   vcdVoteReq, vcdVoteRes, vcdCfg, 
                                    csScenarioIdx, csSessionStore, 
-                                   csBallotStore, csLatest, csDroppedBallot, 
-                                   csReqCnt, csFreshnessStore, csCfg, 
+                                   csBallotStore, csDroppedBallot, csReqCnt, 
+                                   csFreshnessStore, csCfg, 
                                    providerScenarioIdx, providerSessionStore, 
                                    providerCertStore, provAuthSid, provSignSid, 
                                    signScenarioIdx, signAuthChallenge, 
@@ -1413,12 +1521,13 @@ VCD_RecvChoices == /\ pc[VCDPid] = "VCD_RecvChoices"
                                    regOcspStore, regNextOCSPIdx, 
                                    regDroppedLogEntry, vvdScenarioIdx, 
                                    vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                   vvdPendingBdoc, vvdPendingChoices, 
                                    vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_RecvChoice == /\ pc[VCDPid] = "VCD_RecvChoice"
                   /\ chVoterToVCD.tag = "Choose"
                   /\ Assert(chVoterToVCD.body.payload \in vcdCtx.choices, 
-                            "Failure of assertion at line 259, column 5.")
+                            "Failure of assertion at line 270, column 5.")
                   /\ vcdChoice' = chVoterToVCD.body.payload
                   /\ chVCDToCS' = VCDToCS("GetCertReq", vcdCtx.sidCS, NoInt, vcdCtx.tok, NoBody)
                   /\ chVoterToVCD' = NoMsg
@@ -1428,12 +1537,12 @@ VCD_RecvChoice == /\ pc[VCDPid] = "VCD_RecvChoice"
                                   chProviderToSign, chSignToProvider, 
                                   chSignToVoter, chVoterToSign, chCSToReg, 
                                   chRegToCS, chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                  chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                  voterChoice, accepted, voterAccept, 
-                                  verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                  vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
-                                  csScenarioIdx, csSessionStore, csBallotStore, 
-                                  csLatest, csDroppedBallot, csReqCnt, 
+                                  chVVDToVoter, chVoterToVVD, voterScenarioIdx, 
+                                  voterPhase, voterChoice, accepted, 
+                                  voterAccept, verifiedBDOCs, vcdScenarioIdx, 
+                                  vcdCtx, vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                  vcdCfg, csScenarioIdx, csSessionStore, 
+                                  csBallotStore, csDroppedBallot, csReqCnt, 
                                   csFreshnessStore, csCfg, providerScenarioIdx, 
                                   providerSessionStore, providerCertStore, 
                                   provAuthSid, provSignSid, signScenarioIdx, 
@@ -1441,13 +1550,14 @@ VCD_RecvChoice == /\ pc[VCDPid] = "VCD_RecvChoice"
                                   signPhone, regScenarioIdx, regStore, 
                                   regNextIdx, regOcspStore, regNextOCSPIdx, 
                                   regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                  vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                  vvdRejected, vvdCfg >>
+                                  vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                  vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                  vvdCfg >>
 
 VCD_RecvCert == /\ pc[VCDPid] = "VCD_RecvCert"
                 /\ chCSToVCD.tag = "CertRes"
                 /\ Assert(chCSToVCD.body.sidCS = vcdCtx.sidCS, 
-                          "Failure of assertion at line 266, column 5.")
+                          "Failure of assertion at line 277, column 5.")
                 /\ LET cert == chCSToVCD.body.payload IN
                      LET r == ScenarioVCDRand(scenarioIdx) IN
                        LET bdoc == UnsignedBDOC(EGEnc(vcdCfg.decCert.pk, vcdChoice, r), cert) IN
@@ -1460,21 +1570,21 @@ VCD_RecvCert == /\ pc[VCDPid] = "VCD_RecvCert"
                                 chProviderToSign, chSignToProvider, 
                                 chSignToVoter, chVoterToSign, chCSToReg, 
                                 chRegToCS, chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                voterChoice, accepted, voterAccept, 
+                                chVVDToVoter, chVoterToVVD, voterScenarioIdx, 
+                                voterPhase, voterChoice, accepted, voterAccept, 
                                 verifiedBDOCs, vcdScenarioIdx, vcdChoice, 
                                 vcdVoteReq, vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                csSessionStore, csBallotStore, csLatest, 
-                                csDroppedBallot, csReqCnt, csFreshnessStore, 
-                                csCfg, providerScenarioIdx, 
-                                providerSessionStore, providerCertStore, 
-                                provAuthSid, provSignSid, signScenarioIdx, 
-                                signAuthChallenge, authPhone, signChallenge, 
-                                signPhone, regScenarioIdx, regStore, 
-                                regNextIdx, regOcspStore, regNextOCSPIdx, 
-                                regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                vvdRejected, vvdCfg >>
+                                csSessionStore, csBallotStore, csDroppedBallot, 
+                                csReqCnt, csFreshnessStore, csCfg, 
+                                providerScenarioIdx, providerSessionStore, 
+                                providerCertStore, provAuthSid, provSignSid, 
+                                signScenarioIdx, signAuthChallenge, authPhone, 
+                                signChallenge, signPhone, regScenarioIdx, 
+                                regStore, regNextIdx, regOcspStore, 
+                                regNextOCSPIdx, regDroppedLogEntry, 
+                                vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
+                                vvdChoice, vvdPendingBdoc, vvdPendingChoices, 
+                                vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_SendSignReq == /\ pc[VCDPid] = "VCD_SendSignReq"
                    /\ chVCDToCS' = VCDToCS("SignReq", vcdCtx.sidCS, NoInt, vcdCtx.tok, vcdCtx.bdoc.tbs)
@@ -1484,29 +1594,31 @@ VCD_SendSignReq == /\ pc[VCDPid] = "VCD_SendSignReq"
                                    chProviderToSign, chSignToProvider, 
                                    chSignToVoter, chVoterToSign, chCSToReg, 
                                    chRegToCS, chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                   chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                   voterChoice, accepted, voterAccept, 
-                                   verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                   vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                   vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                   csSessionStore, csBallotStore, csLatest, 
-                                   csDroppedBallot, csReqCnt, csFreshnessStore, 
-                                   csCfg, providerScenarioIdx, 
-                                   providerSessionStore, providerCertStore, 
-                                   provAuthSid, provSignSid, signScenarioIdx, 
-                                   signAuthChallenge, authPhone, signChallenge, 
-                                   signPhone, regScenarioIdx, regStore, 
-                                   regNextIdx, regOcspStore, regNextOCSPIdx, 
+                                   chVVDToVoter, chVoterToVVD, 
+                                   voterScenarioIdx, voterPhase, voterChoice, 
+                                   accepted, voterAccept, verifiedBDOCs, 
+                                   vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                   vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
+                                   csScenarioIdx, csSessionStore, 
+                                   csBallotStore, csDroppedBallot, csReqCnt, 
+                                   csFreshnessStore, csCfg, 
+                                   providerScenarioIdx, providerSessionStore, 
+                                   providerCertStore, provAuthSid, provSignSid, 
+                                   signScenarioIdx, signAuthChallenge, 
+                                   authPhone, signChallenge, signPhone, 
+                                   regScenarioIdx, regStore, regNextIdx, 
+                                   regOcspStore, regNextOCSPIdx, 
                                    regDroppedLogEntry, vvdScenarioIdx, 
                                    vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                   vvdPendingBdoc, vvdPendingChoices, 
                                    vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_RecvSignRes == /\ pc[VCDPid] = "VCD_RecvSignRes"
                    /\ chCSToVCD.tag = "SignChallenge"
                    /\ Assert(chCSToVCD.body.sidCS = vcdCtx.sidCS, 
-                             "Failure of assertion at line 280, column 5.")
+                             "Failure of assertion at line 291, column 5.")
                    /\ Assert(chCSToVCD.body.payload = vcdCtx.bdoc.tbs, 
-                             "Failure of assertion at line 281, column 5.")
+                             "Failure of assertion at line 292, column 5.")
                    /\ vcdCtx' = [vcdCtx EXCEPT !.sidSign = chCSToVCD.body.sidProv]
                    /\ chVCDToVoter' = VCDToVoter("SignChallengeDisplay", [challenge |-> chCSToVCD.body.payload, cert |-> vcdCtx'.bdoc.signerCert])
                    /\ chCSToVCD' = NoMsg
@@ -1516,13 +1628,14 @@ VCD_RecvSignRes == /\ pc[VCDPid] = "VCD_RecvSignRes"
                                    chProviderToSign, chSignToProvider, 
                                    chSignToVoter, chVoterToSign, chCSToReg, 
                                    chRegToCS, chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                   chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                   voterChoice, accepted, voterAccept, 
-                                   verifiedBDOCs, vcdScenarioIdx, vcdChoice, 
-                                   vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
+                                   chVVDToVoter, chVoterToVVD, 
+                                   voterScenarioIdx, voterPhase, voterChoice, 
+                                   accepted, voterAccept, verifiedBDOCs, 
+                                   vcdScenarioIdx, vcdChoice, vcdVoteBDOC, 
+                                   vcdVoteReq, vcdVoteRes, vcdCfg, 
                                    csScenarioIdx, csSessionStore, 
-                                   csBallotStore, csLatest, csDroppedBallot, 
-                                   csReqCnt, csFreshnessStore, csCfg, 
+                                   csBallotStore, csDroppedBallot, csReqCnt, 
+                                   csFreshnessStore, csCfg, 
                                    providerScenarioIdx, providerSessionStore, 
                                    providerCertStore, provAuthSid, provSignSid, 
                                    signScenarioIdx, signAuthChallenge, 
@@ -1531,6 +1644,7 @@ VCD_RecvSignRes == /\ pc[VCDPid] = "VCD_RecvSignRes"
                                    regOcspStore, regNextOCSPIdx, 
                                    regDroppedLogEntry, vvdScenarioIdx, 
                                    vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                   vvdPendingBdoc, vvdPendingChoices, 
                                    vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_SendSignStatusReq == /\ pc[VCDPid] = "VCD_SendSignStatusReq"
@@ -1544,14 +1658,14 @@ VCD_SendSignStatusReq == /\ pc[VCDPid] = "VCD_SendSignStatusReq"
                                          chSignToVoter, chVoterToSign, 
                                          chCSToReg, chRegToCS, chVCDToVVD, 
                                          chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                         voterScenarioIdx, voterPhase, 
-                                         voterChoice, accepted, voterAccept, 
-                                         verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                         vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                         vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                         csSessionStore, csBallotStore, 
-                                         csLatest, csDroppedBallot, csReqCnt, 
-                                         csFreshnessStore, csCfg, 
+                                         chVoterToVVD, voterScenarioIdx, 
+                                         voterPhase, voterChoice, accepted, 
+                                         voterAccept, verifiedBDOCs, 
+                                         vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                         vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                         vcdCfg, csScenarioIdx, csSessionStore, 
+                                         csBallotStore, csDroppedBallot, 
+                                         csReqCnt, csFreshnessStore, csCfg, 
                                          providerScenarioIdx, 
                                          providerSessionStore, 
                                          providerCertStore, provAuthSid, 
@@ -1562,14 +1676,15 @@ VCD_SendSignStatusReq == /\ pc[VCDPid] = "VCD_SendSignStatusReq"
                                          regOcspStore, regNextOCSPIdx, 
                                          regDroppedLogEntry, vvdScenarioIdx, 
                                          vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                         vvdPendingBdoc, vvdPendingChoices, 
                                          vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_RecvSignResult == /\ pc[VCDPid] = "VCD_RecvSignResult"
                       /\ chCSToVCD.tag = "SignStatusRes"
                       /\ Assert(chCSToVCD.body.sidCS = vcdCtx.sidCS, 
-                                "Failure of assertion at line 293, column 5.")
+                                "Failure of assertion at line 304, column 5.")
                       /\ Assert(Verify(vcdCtx.bdoc.signerCert.pk, vcdCtx.bdoc.tbs, chCSToVCD.body.payload), 
-                                "Failure of assertion at line 294, column 9.")
+                                "Failure of assertion at line 305, column 9.")
                       /\ LET bdoc == SignedBDOC(vcdCtx.bdoc.ct, vcdCtx.bdoc.signerCert, chCSToVCD.body.payload) IN
                            /\ vcdVoteBDOC' = bdoc
                            /\ vcdCtx' = [vcdCtx EXCEPT !.bdoc = bdoc]
@@ -1581,13 +1696,13 @@ VCD_RecvSignResult == /\ pc[VCDPid] = "VCD_RecvSignResult"
                                       chSignToProvider, chSignToVoter, 
                                       chVoterToSign, chCSToReg, chRegToCS, 
                                       chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                      chVVDToVoter, voterScenarioIdx, 
-                                      voterPhase, voterChoice, accepted, 
-                                      voterAccept, verifiedBDOCs, 
-                                      vcdScenarioIdx, vcdChoice, vcdVoteReq, 
-                                      vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                      csSessionStore, csBallotStore, csLatest, 
-                                      csDroppedBallot, csReqCnt, 
+                                      chVVDToVoter, chVoterToVVD, 
+                                      voterScenarioIdx, voterPhase, 
+                                      voterChoice, accepted, voterAccept, 
+                                      verifiedBDOCs, vcdScenarioIdx, vcdChoice, 
+                                      vcdVoteReq, vcdVoteRes, vcdCfg, 
+                                      csScenarioIdx, csSessionStore, 
+                                      csBallotStore, csDroppedBallot, csReqCnt, 
                                       csFreshnessStore, csCfg, 
                                       providerScenarioIdx, 
                                       providerSessionStore, providerCertStore, 
@@ -1598,6 +1713,7 @@ VCD_RecvSignResult == /\ pc[VCDPid] = "VCD_RecvSignResult"
                                       regOcspStore, regNextOCSPIdx, 
                                       regDroppedLogEntry, vvdScenarioIdx, 
                                       vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                      vvdPendingBdoc, vvdPendingChoices, 
                                       vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_SubmitVote == /\ pc[VCDPid] = "VCD_SubmitVote"
@@ -1609,12 +1725,12 @@ VCD_SubmitVote == /\ pc[VCDPid] = "VCD_SubmitVote"
                                   chProviderToSign, chSignToProvider, 
                                   chSignToVoter, chVoterToSign, chCSToReg, 
                                   chRegToCS, chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                  chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                  voterChoice, accepted, voterAccept, 
-                                  verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                  vcdChoice, vcdVoteBDOC, vcdVoteRes, vcdCfg, 
-                                  csScenarioIdx, csSessionStore, csBallotStore, 
-                                  csLatest, csDroppedBallot, csReqCnt, 
+                                  chVVDToVoter, chVoterToVVD, voterScenarioIdx, 
+                                  voterPhase, voterChoice, accepted, 
+                                  voterAccept, verifiedBDOCs, vcdScenarioIdx, 
+                                  vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteRes, 
+                                  vcdCfg, csScenarioIdx, csSessionStore, 
+                                  csBallotStore, csDroppedBallot, csReqCnt, 
                                   csFreshnessStore, csCfg, providerScenarioIdx, 
                                   providerSessionStore, providerCertStore, 
                                   provAuthSid, provSignSid, signScenarioIdx, 
@@ -1622,15 +1738,16 @@ VCD_SubmitVote == /\ pc[VCDPid] = "VCD_SubmitVote"
                                   signPhone, regScenarioIdx, regStore, 
                                   regNextIdx, regOcspStore, regNextOCSPIdx, 
                                   regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                  vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                  vvdRejected, vvdCfg >>
+                                  vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                  vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                  vvdCfg >>
 
 VCD_RecvVoteRes == /\ pc[VCDPid] = "VCD_RecvVoteRes"
                    /\ chCSToVCD.tag = "VoteRes"
                    /\ Assert(chCSToVCD.body.sidCS = vcdCtx.sidCS, 
-                             "Failure of assertion at line 307, column 5.")
+                             "Failure of assertion at line 318, column 5.")
                    /\ Assert(VerifyVoteRes(vcdCfg, chCSToVCD.body.payload, vcdVoteBDOC), 
-                             "Failure of assertion at line 308, column 5.")
+                             "Failure of assertion at line 319, column 5.")
                    /\ vcdVoteRes' = chCSToVCD.body.payload
                    /\ chVCDToVoter' = VCDToVoter("Voted", NoBody)
                    /\ chCSToVCD' = NoMsg
@@ -1640,13 +1757,14 @@ VCD_RecvVoteRes == /\ pc[VCDPid] = "VCD_RecvVoteRes"
                                    chProviderToSign, chSignToProvider, 
                                    chSignToVoter, chVoterToSign, chCSToReg, 
                                    chRegToCS, chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                   chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                   voterChoice, accepted, voterAccept, 
-                                   verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                   vcdChoice, vcdVoteBDOC, vcdVoteReq, vcdCfg, 
+                                   chVVDToVoter, chVoterToVVD, 
+                                   voterScenarioIdx, voterPhase, voterChoice, 
+                                   accepted, voterAccept, verifiedBDOCs, 
+                                   vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                   vcdVoteBDOC, vcdVoteReq, vcdCfg, 
                                    csScenarioIdx, csSessionStore, 
-                                   csBallotStore, csLatest, csDroppedBallot, 
-                                   csReqCnt, csFreshnessStore, csCfg, 
+                                   csBallotStore, csDroppedBallot, csReqCnt, 
+                                   csFreshnessStore, csCfg, 
                                    providerScenarioIdx, providerSessionStore, 
                                    providerCertStore, provAuthSid, provSignSid, 
                                    signScenarioIdx, signAuthChallenge, 
@@ -1655,6 +1773,7 @@ VCD_RecvVoteRes == /\ pc[VCDPid] = "VCD_RecvVoteRes"
                                    regOcspStore, regNextOCSPIdx, 
                                    regDroppedLogEntry, vvdScenarioIdx, 
                                    vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                   vvdPendingBdoc, vvdPendingChoices, 
                                    vvdAccepted, vvdRejected, vvdCfg >>
 
 VCD_SendToVVD == /\ pc[VCDPid] = "VCD_SendToVVD"
@@ -1667,21 +1786,23 @@ VCD_SendToVVD == /\ pc[VCDPid] = "VCD_SendToVVD"
                                  chProviderToSign, chSignToProvider, 
                                  chSignToVoter, chVoterToSign, chCSToReg, 
                                  chRegToCS, chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                 voterScenarioIdx, voterPhase, voterChoice, 
-                                 accepted, voterAccept, verifiedBDOCs, 
-                                 vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                 vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
-                                 csScenarioIdx, csSessionStore, csBallotStore, 
-                                 csLatest, csDroppedBallot, csReqCnt, 
-                                 csFreshnessStore, csCfg, providerScenarioIdx, 
+                                 chVoterToVVD, voterScenarioIdx, voterPhase, 
+                                 voterChoice, accepted, voterAccept, 
+                                 verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                 vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                 vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                 csSessionStore, csBallotStore, 
+                                 csDroppedBallot, csReqCnt, csFreshnessStore, 
+                                 csCfg, providerScenarioIdx, 
                                  providerSessionStore, providerCertStore, 
                                  provAuthSid, provSignSid, signScenarioIdx, 
                                  signAuthChallenge, authPhone, signChallenge, 
                                  signPhone, regScenarioIdx, regStore, 
                                  regNextIdx, regOcspStore, regNextOCSPIdx, 
                                  regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                 vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                 vvdRejected, vvdCfg >>
+                                 vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                 vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                 vvdCfg >>
 
 VCD_Done == /\ pc[VCDPid] = "VCD_Done"
             /\ IF vcdScenarioIdx < Len(VotingScenario)
@@ -1701,19 +1822,20 @@ VCD_Done == /\ pc[VCDPid] = "VCD_Done"
                             chCSToVCD, chCSToProvider, chProviderToCS, 
                             chProviderToSign, chSignToProvider, chSignToVoter, 
                             chVoterToSign, chCSToReg, chRegToCS, chVCDToVVD, 
-                            chVVDToCS, chCSToVVD, chVVDToVoter, 
+                            chVVDToCS, chCSToVVD, chVVDToVoter, chVoterToVVD, 
                             voterScenarioIdx, voterPhase, voterChoice, 
                             accepted, voterAccept, verifiedBDOCs, vcdCfg, 
                             csScenarioIdx, csSessionStore, csBallotStore, 
-                            csLatest, csDroppedBallot, csReqCnt, 
-                            csFreshnessStore, csCfg, providerScenarioIdx, 
-                            providerSessionStore, providerCertStore, 
-                            provAuthSid, provSignSid, signScenarioIdx, 
-                            signAuthChallenge, authPhone, signChallenge, 
-                            signPhone, regScenarioIdx, regStore, regNextIdx, 
-                            regOcspStore, regNextOCSPIdx, regDroppedLogEntry, 
-                            vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                            vvdChoice, vvdAccepted, vvdRejected, vvdCfg >>
+                            csDroppedBallot, csReqCnt, csFreshnessStore, csCfg, 
+                            providerScenarioIdx, providerSessionStore, 
+                            providerCertStore, provAuthSid, provSignSid, 
+                            signScenarioIdx, signAuthChallenge, authPhone, 
+                            signChallenge, signPhone, regScenarioIdx, regStore, 
+                            regNextIdx, regOcspStore, regNextOCSPIdx, 
+                            regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
+                            vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                            vvdPendingChoices, vvdAccepted, vvdRejected, 
+                            vvdCfg >>
 
 VCDProc == VCD_RecvStartVoting \/ VCD_RecvAuthRes \/ VCD_RecvAuthApproval
               \/ VCD_RecvAuthStatus \/ VCD_SendChoicesReq
@@ -1731,7 +1853,7 @@ CS_RecvAuthReq == /\ pc[CSPid] = "CS_RecvAuthReq"
                          LET t == PhaseAuthTime IN
                            /\ LET upd == VerifyAndUpdateSession(csCfg, csSessionStore, req.csSid, "Auth", Empty, p, t) IN
                                 /\ Assert(upd.ok, 
-                                          "Failure of assertion at line 352, column 9.")
+                                          "Failure of assertion at line 363, column 9.")
                                 /\ csSessionStore' = StorePut(upd.store, req.csSid, [upd.session EXCEPT !.ctx = FreshSessionCtx(req)])
                            /\ chCSToProvider' = CSToProvider("AuthStart", req.csSid, NoInt, [challenge |-> req.authChallenge, voterRef |-> VoterRef(p.voterId, p.phone)])
                            /\ chVCDToCS' = NoMsg
@@ -1741,12 +1863,12 @@ CS_RecvAuthReq == /\ pc[CSPid] = "CS_RecvAuthReq"
                                   chSignToProvider, chSignToVoter, 
                                   chVoterToSign, chCSToReg, chRegToCS, 
                                   chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                  chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                  voterChoice, accepted, voterAccept, 
-                                  verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                  vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                  chVVDToVoter, chVoterToVVD, voterScenarioIdx, 
+                                  voterPhase, voterChoice, accepted, 
+                                  voterAccept, verifiedBDOCs, vcdScenarioIdx, 
+                                  vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, 
                                   vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                  csBallotStore, csLatest, csDroppedBallot, 
+                                  csBallotStore, csDroppedBallot, 
                                   csFreshnessStore, csCfg, providerScenarioIdx, 
                                   providerSessionStore, providerCertStore, 
                                   provAuthSid, provSignSid, signScenarioIdx, 
@@ -1754,16 +1876,17 @@ CS_RecvAuthReq == /\ pc[CSPid] = "CS_RecvAuthReq"
                                   signPhone, regScenarioIdx, regStore, 
                                   regNextIdx, regOcspStore, regNextOCSPIdx, 
                                   regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                  vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                  vvdRejected, vvdCfg >>
+                                  vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                  vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                  vvdCfg >>
 
 CS_RecvAuthStarted == /\ pc[CSPid] = "CS_RecvAuthStarted"
                       /\ chProviderToCS.tag = "AuthStarted"
                       /\ LET session == StoreLookup(csSessionStore, chProviderToCS.body.sidCS) IN
                            /\ Assert(session # Empty, 
-                                     "Failure of assertion at line 362, column 7.")
+                                     "Failure of assertion at line 373, column 7.")
                            /\ Assert(chProviderToCS.body.payload.challenge = session.ctx.authChallenge, 
-                                     "Failure of assertion at line 363, column 25.")
+                                     "Failure of assertion at line 374, column 25.")
                            /\ chCSToVCD' = CSToVCD("AuthRes", chProviderToCS.body.sidCS, chProviderToCS.body.sidProv, chProviderToCS.body.payload)
                            /\ chProviderToCS' = NoMsg
                       /\ pc' = [pc EXCEPT ![CSPid] = "CS_SendAuthStatusReq"]
@@ -1772,13 +1895,13 @@ CS_RecvAuthStarted == /\ pc[CSPid] = "CS_RecvAuthStarted"
                                       chProviderToSign, chSignToProvider, 
                                       chSignToVoter, chVoterToSign, chCSToReg, 
                                       chRegToCS, chVCDToVVD, chVVDToCS, 
-                                      chCSToVVD, chVVDToVoter, 
+                                      chCSToVVD, chVVDToVoter, chVoterToVVD, 
                                       voterScenarioIdx, voterPhase, 
                                       voterChoice, accepted, voterAccept, 
                                       verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
                                       vcdChoice, vcdVoteBDOC, vcdVoteReq, 
                                       vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                      csSessionStore, csBallotStore, csLatest, 
+                                      csSessionStore, csBallotStore, 
                                       csDroppedBallot, csReqCnt, 
                                       csFreshnessStore, csCfg, 
                                       providerScenarioIdx, 
@@ -1790,6 +1913,7 @@ CS_RecvAuthStarted == /\ pc[CSPid] = "CS_RecvAuthStarted"
                                       regOcspStore, regNextOCSPIdx, 
                                       regDroppedLogEntry, vvdScenarioIdx, 
                                       vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                      vvdPendingBdoc, vvdPendingChoices, 
                                       vvdAccepted, vvdRejected, vvdCfg >>
 
 CS_SendAuthStatusReq == /\ pc[CSPid] = "CS_SendAuthStatusReq"
@@ -1797,7 +1921,7 @@ CS_SendAuthStatusReq == /\ pc[CSPid] = "CS_SendAuthStatusReq"
                         /\ LET t == PhaseAuthStatusTime IN
                              LET upd == VerifyAndUpdateSession(csCfg, csSessionStore, chVCDToCS.body.sidCS, "AuthStatus", Empty, NoVoterRef, t) IN
                                /\ Assert(upd.ok, 
-                                         "Failure of assertion at line 372, column 7.")
+                                         "Failure of assertion at line 383, column 7.")
                                /\ csSessionStore' = upd.store
                                /\ chCSToProvider' = CSToProvider("AuthStatusReq", chVCDToCS.body.sidCS, chVCDToCS.body.sidProv, NoBody)
                                /\ chVCDToCS' = NoMsg
@@ -1808,14 +1932,14 @@ CS_SendAuthStatusReq == /\ pc[CSPid] = "CS_SendAuthStatusReq"
                                         chSignToProvider, chSignToVoter, 
                                         chVoterToSign, chCSToReg, chRegToCS, 
                                         chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                        chVVDToVoter, voterScenarioIdx, 
-                                        voterPhase, voterChoice, accepted, 
-                                        voterAccept, verifiedBDOCs, 
-                                        vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                        vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
-                                        vcdCfg, csScenarioIdx, csBallotStore, 
-                                        csLatest, csDroppedBallot, csReqCnt, 
-                                        csFreshnessStore, csCfg, 
+                                        chVVDToVoter, chVoterToVVD, 
+                                        voterScenarioIdx, voterPhase, 
+                                        voterChoice, accepted, voterAccept, 
+                                        verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                        vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                        vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                        csBallotStore, csDroppedBallot, 
+                                        csReqCnt, csFreshnessStore, csCfg, 
                                         providerScenarioIdx, 
                                         providerSessionStore, 
                                         providerCertStore, provAuthSid, 
@@ -1826,6 +1950,7 @@ CS_SendAuthStatusReq == /\ pc[CSPid] = "CS_SendAuthStatusReq"
                                         regOcspStore, regNextOCSPIdx, 
                                         regDroppedLogEntry, vvdScenarioIdx, 
                                         vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                        vvdPendingBdoc, vvdPendingChoices, 
                                         vvdAccepted, vvdRejected, vvdCfg >>
 
 CS_RecvAuthStatusRes == /\ pc[CSPid] = "CS_RecvAuthStatusRes"
@@ -1833,15 +1958,18 @@ CS_RecvAuthStatusRes == /\ pc[CSPid] = "CS_RecvAuthStatusRes"
                         /\ LET cert == chProviderToCS.body.payload.cert IN
                              LET session == StoreLookup(csSessionStore, chProviderToCS.body.sidCS) IN
                                /\ Assert(session # Empty, 
-                                         "Failure of assertion at line 382, column 9.")
+                                         "Failure of assertion at line 393, column 9.")
                                /\ Assert(VerifyTrustedX509Cert(csCfg.cfg.rootCACert, cert), 
-                                         "Failure of assertion at line 383, column 33.")
+                                         "Failure of assertion at line 394, column 33.")
                                /\ Assert(Verify(cert.pk, session.ctx.authChallenge, chProviderToCS.body.payload.sig), 
-                                         "Failure of assertion at line 384, column 33.")
+                                         "Failure of assertion at line 395, column 33.")
                                /\ LET tok == CreateAuthToken(CSSymKey, cert, session.ctx.issuedVid, session.ctx.authTokNonce) IN
                                     /\ csSessionStore' = StorePut(csSessionStore,
                                                                                                                                                        chProviderToCS.body.sidCS,
-                                                                                                                                                       [session EXCEPT !.phase = "AuthStatus", !.tok = tok, !.exp = PhaseAuthStatusTime + csCfg.stageTTL])
+                                                                                                                                                       [session EXCEPT !.phase = "AuthStatus",
+                                                                   !.voterId = cert.pnoee,
+                                                                   !.tok = tok,
+                                                                   !.exp = PhaseAuthStatusTime + csCfg.stageTTL])
                                     /\ chCSToVCD' = CSToVCD("AuthStatusRes", chProviderToCS.body.sidCS, NoInt, tok)
                         /\ chProviderToCS' = NoMsg
                         /\ pc' = [pc EXCEPT ![CSPid] = "CS_RecvChoicesReq"]
@@ -1851,14 +1979,14 @@ CS_RecvAuthStatusRes == /\ pc[CSPid] = "CS_RecvAuthStatusRes"
                                         chSignToProvider, chSignToVoter, 
                                         chVoterToSign, chCSToReg, chRegToCS, 
                                         chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                        chVVDToVoter, voterScenarioIdx, 
-                                        voterPhase, voterChoice, accepted, 
-                                        voterAccept, verifiedBDOCs, 
-                                        vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                        vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
-                                        vcdCfg, csScenarioIdx, csBallotStore, 
-                                        csLatest, csDroppedBallot, csReqCnt, 
-                                        csFreshnessStore, csCfg, 
+                                        chVVDToVoter, chVoterToVVD, 
+                                        voterScenarioIdx, voterPhase, 
+                                        voterChoice, accepted, voterAccept, 
+                                        verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                        vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                        vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                        csBallotStore, csDroppedBallot, 
+                                        csReqCnt, csFreshnessStore, csCfg, 
                                         providerScenarioIdx, 
                                         providerSessionStore, 
                                         providerCertStore, provAuthSid, 
@@ -1869,6 +1997,7 @@ CS_RecvAuthStatusRes == /\ pc[CSPid] = "CS_RecvAuthStatusRes"
                                         regOcspStore, regNextOCSPIdx, 
                                         regDroppedLogEntry, vvdScenarioIdx, 
                                         vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                        vvdPendingBdoc, vvdPendingChoices, 
                                         vvdAccepted, vvdRejected, vvdCfg >>
 
 CS_RecvChoicesReq == /\ pc[CSPid] = "CS_RecvChoicesReq"
@@ -1876,7 +2005,7 @@ CS_RecvChoicesReq == /\ pc[CSPid] = "CS_RecvChoicesReq"
                      /\ LET t == PhaseChoicesTime IN
                           LET upd == VerifyAndUpdateSession(csCfg, csSessionStore, chVCDToCS.body.sidCS, "Choices", chVCDToCS.body.tok, NoVoterRef, t) IN
                             /\ Assert(upd.ok, 
-                                      "Failure of assertion at line 399, column 7.")
+                                      "Failure of assertion at line 413, column 7.")
                             /\ csSessionStore' = upd.store
                             /\ chCSToVCD' = CSToVCD("ChoicesRes", chVCDToCS.body.sidCS, NoInt, csCfg.cfg.choices)
                             /\ chVCDToCS' = NoMsg
@@ -1886,13 +2015,13 @@ CS_RecvChoicesReq == /\ pc[CSPid] = "CS_RecvChoicesReq"
                                      chProviderToSign, chSignToProvider, 
                                      chSignToVoter, chVoterToSign, chCSToReg, 
                                      chRegToCS, chVCDToVVD, chVVDToCS, 
-                                     chCSToVVD, chVVDToVoter, voterScenarioIdx, 
-                                     voterPhase, voterChoice, accepted, 
-                                     voterAccept, verifiedBDOCs, 
+                                     chCSToVVD, chVVDToVoter, chVoterToVVD, 
+                                     voterScenarioIdx, voterPhase, voterChoice, 
+                                     accepted, voterAccept, verifiedBDOCs, 
                                      vcdScenarioIdx, vcdCtx, vcdChoice, 
                                      vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
                                      vcdCfg, csScenarioIdx, csBallotStore, 
-                                     csLatest, csDroppedBallot, csReqCnt, 
+                                     csDroppedBallot, csReqCnt, 
                                      csFreshnessStore, csCfg, 
                                      providerScenarioIdx, providerSessionStore, 
                                      providerCertStore, provAuthSid, 
@@ -1902,15 +2031,16 @@ CS_RecvChoicesReq == /\ pc[CSPid] = "CS_RecvChoicesReq"
                                      regStore, regNextIdx, regOcspStore, 
                                      regNextOCSPIdx, regDroppedLogEntry, 
                                      vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                                     vvdChoice, vvdAccepted, vvdRejected, 
-                                     vvdCfg >>
+                                     vvdChoice, vvdPendingBdoc, 
+                                     vvdPendingChoices, vvdAccepted, 
+                                     vvdRejected, vvdCfg >>
 
 CS_RecvGetCertReq == /\ pc[CSPid] = "CS_RecvGetCertReq"
                      /\ chVCDToCS.tag = "GetCertReq"
                      /\ LET t == PhaseCertTime IN
                           LET upd == VerifyAndUpdateSession(csCfg, csSessionStore, chVCDToCS.body.sidCS, "Cert", chVCDToCS.body.tok, NoVoterRef, t) IN
                             /\ Assert(upd.ok, 
-                                      "Failure of assertion at line 409, column 7.")
+                                      "Failure of assertion at line 423, column 7.")
                             /\ csSessionStore' = upd.store
                             /\ chCSToProvider' = CSToProvider("GetCertReq", chVCDToCS.body.sidCS, NoInt, [phone |-> upd.session.phone])
                             /\ chVCDToCS' = NoMsg
@@ -1920,13 +2050,13 @@ CS_RecvGetCertReq == /\ pc[CSPid] = "CS_RecvGetCertReq"
                                      chProviderToSign, chSignToProvider, 
                                      chSignToVoter, chVoterToSign, chCSToReg, 
                                      chRegToCS, chVCDToVVD, chVVDToCS, 
-                                     chCSToVVD, chVVDToVoter, voterScenarioIdx, 
-                                     voterPhase, voterChoice, accepted, 
-                                     voterAccept, verifiedBDOCs, 
+                                     chCSToVVD, chVVDToVoter, chVoterToVVD, 
+                                     voterScenarioIdx, voterPhase, voterChoice, 
+                                     accepted, voterAccept, verifiedBDOCs, 
                                      vcdScenarioIdx, vcdCtx, vcdChoice, 
                                      vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
                                      vcdCfg, csScenarioIdx, csBallotStore, 
-                                     csLatest, csDroppedBallot, csReqCnt, 
+                                     csDroppedBallot, csReqCnt, 
                                      csFreshnessStore, csCfg, 
                                      providerScenarioIdx, providerSessionStore, 
                                      providerCertStore, provAuthSid, 
@@ -1936,13 +2066,14 @@ CS_RecvGetCertReq == /\ pc[CSPid] = "CS_RecvGetCertReq"
                                      regStore, regNextIdx, regOcspStore, 
                                      regNextOCSPIdx, regDroppedLogEntry, 
                                      vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                                     vvdChoice, vvdAccepted, vvdRejected, 
-                                     vvdCfg >>
+                                     vvdChoice, vvdPendingBdoc, 
+                                     vvdPendingChoices, vvdAccepted, 
+                                     vvdRejected, vvdCfg >>
 
 CS_RecvGetCertRes == /\ pc[CSPid] = "CS_RecvGetCertRes"
                      /\ chProviderToCS.tag = "GetCertRes"
                      /\ Assert(StoreLookup(csSessionStore, chProviderToCS.body.sidCS) # Empty, 
-                               "Failure of assertion at line 417, column 5.")
+                               "Failure of assertion at line 431, column 5.")
                      /\ chCSToVCD' = CSToVCD("CertRes", chProviderToCS.body.sidCS, NoInt, chProviderToCS.body.payload)
                      /\ chProviderToCS' = NoMsg
                      /\ pc' = [pc EXCEPT ![CSPid] = "CS_RecvSignReq"]
@@ -1951,14 +2082,14 @@ CS_RecvGetCertRes == /\ pc[CSPid] = "CS_RecvGetCertRes"
                                      chProviderToSign, chSignToProvider, 
                                      chSignToVoter, chVoterToSign, chCSToReg, 
                                      chRegToCS, chVCDToVVD, chVVDToCS, 
-                                     chCSToVVD, chVVDToVoter, voterScenarioIdx, 
-                                     voterPhase, voterChoice, accepted, 
-                                     voterAccept, verifiedBDOCs, 
+                                     chCSToVVD, chVVDToVoter, chVoterToVVD, 
+                                     voterScenarioIdx, voterPhase, voterChoice, 
+                                     accepted, voterAccept, verifiedBDOCs, 
                                      vcdScenarioIdx, vcdCtx, vcdChoice, 
                                      vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
                                      vcdCfg, csScenarioIdx, csSessionStore, 
-                                     csBallotStore, csLatest, csDroppedBallot, 
-                                     csReqCnt, csFreshnessStore, csCfg, 
+                                     csBallotStore, csDroppedBallot, csReqCnt, 
+                                     csFreshnessStore, csCfg, 
                                      providerScenarioIdx, providerSessionStore, 
                                      providerCertStore, provAuthSid, 
                                      provSignSid, signScenarioIdx, 
@@ -1967,15 +2098,16 @@ CS_RecvGetCertRes == /\ pc[CSPid] = "CS_RecvGetCertRes"
                                      regStore, regNextIdx, regOcspStore, 
                                      regNextOCSPIdx, regDroppedLogEntry, 
                                      vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                                     vvdChoice, vvdAccepted, vvdRejected, 
-                                     vvdCfg >>
+                                     vvdChoice, vvdPendingBdoc, 
+                                     vvdPendingChoices, vvdAccepted, 
+                                     vvdRejected, vvdCfg >>
 
 CS_RecvSignReq == /\ pc[CSPid] = "CS_RecvSignReq"
                   /\ chVCDToCS.tag = "SignReq"
                   /\ LET t == PhaseSignTime IN
                        LET upd == VerifyAndUpdateSession(csCfg, csSessionStore, chVCDToCS.body.sidCS, "Sign", chVCDToCS.body.tok, NoVoterRef, t) IN
                          /\ Assert(upd.ok, 
-                                   "Failure of assertion at line 425, column 7.")
+                                   "Failure of assertion at line 439, column 7.")
                          /\ LET session == [upd.session EXCEPT !.ctx.signDigest = chVCDToCS.body.payload] IN
                               /\ csSessionStore' = StorePut(upd.store, chVCDToCS.body.sidCS, session)
                               /\ chCSToProvider' = CSToProvider("SignStart", chVCDToCS.body.sidCS, NoInt, [challenge |-> session.ctx.signDigest, voterRef |-> VoterRef(session.voterId, session.phone)])
@@ -1986,28 +2118,28 @@ CS_RecvSignReq == /\ pc[CSPid] = "CS_RecvSignReq"
                                   chSignToProvider, chSignToVoter, 
                                   chVoterToSign, chCSToReg, chRegToCS, 
                                   chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                  chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                  voterChoice, accepted, voterAccept, 
-                                  verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                  vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                  chVVDToVoter, chVoterToVVD, voterScenarioIdx, 
+                                  voterPhase, voterChoice, accepted, 
+                                  voterAccept, verifiedBDOCs, vcdScenarioIdx, 
+                                  vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, 
                                   vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                  csBallotStore, csLatest, csDroppedBallot, 
-                                  csReqCnt, csFreshnessStore, csCfg, 
-                                  providerScenarioIdx, providerSessionStore, 
-                                  providerCertStore, provAuthSid, provSignSid, 
-                                  signScenarioIdx, signAuthChallenge, 
-                                  authPhone, signChallenge, signPhone, 
-                                  regScenarioIdx, regStore, regNextIdx, 
-                                  regOcspStore, regNextOCSPIdx, 
+                                  csBallotStore, csDroppedBallot, csReqCnt, 
+                                  csFreshnessStore, csCfg, providerScenarioIdx, 
+                                  providerSessionStore, providerCertStore, 
+                                  provAuthSid, provSignSid, signScenarioIdx, 
+                                  signAuthChallenge, authPhone, signChallenge, 
+                                  signPhone, regScenarioIdx, regStore, 
+                                  regNextIdx, regOcspStore, regNextOCSPIdx, 
                                   regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                  vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                  vvdRejected, vvdCfg >>
+                                  vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                  vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                  vvdCfg >>
 
 CS_RecvSignStarted == /\ pc[CSPid] = "CS_RecvSignStarted"
                       /\ chProviderToCS.tag = "SignStarted"
                       /\ LET session == StoreLookup(csSessionStore, chProviderToCS.body.sidCS) IN
                            /\ Assert(session # Empty, 
-                                     "Failure of assertion at line 436, column 7.")
+                                     "Failure of assertion at line 450, column 7.")
                            /\ chCSToVCD' = CSToVCD("SignChallenge", chProviderToCS.body.sidCS, chProviderToCS.body.sidProv, session.ctx.signDigest)
                       /\ chProviderToCS' = NoMsg
                       /\ pc' = [pc EXCEPT ![CSPid] = "CS_SendSignStatusReq"]
@@ -2016,13 +2148,13 @@ CS_RecvSignStarted == /\ pc[CSPid] = "CS_RecvSignStarted"
                                       chProviderToSign, chSignToProvider, 
                                       chSignToVoter, chVoterToSign, chCSToReg, 
                                       chRegToCS, chVCDToVVD, chVVDToCS, 
-                                      chCSToVVD, chVVDToVoter, 
+                                      chCSToVVD, chVVDToVoter, chVoterToVVD, 
                                       voterScenarioIdx, voterPhase, 
                                       voterChoice, accepted, voterAccept, 
                                       verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
                                       vcdChoice, vcdVoteBDOC, vcdVoteReq, 
                                       vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                      csSessionStore, csBallotStore, csLatest, 
+                                      csSessionStore, csBallotStore, 
                                       csDroppedBallot, csReqCnt, 
                                       csFreshnessStore, csCfg, 
                                       providerScenarioIdx, 
@@ -2034,6 +2166,7 @@ CS_RecvSignStarted == /\ pc[CSPid] = "CS_RecvSignStarted"
                                       regOcspStore, regNextOCSPIdx, 
                                       regDroppedLogEntry, vvdScenarioIdx, 
                                       vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                      vvdPendingBdoc, vvdPendingChoices, 
                                       vvdAccepted, vvdRejected, vvdCfg >>
 
 CS_SendSignStatusReq == /\ pc[CSPid] = "CS_SendSignStatusReq"
@@ -2041,7 +2174,7 @@ CS_SendSignStatusReq == /\ pc[CSPid] = "CS_SendSignStatusReq"
                         /\ LET t == PhaseSignStatusTime IN
                              LET upd == VerifyAndUpdateSession(csCfg, csSessionStore, chVCDToCS.body.sidCS, "SignStatus", Empty, NoVoterRef, t) IN
                                /\ Assert(upd.ok, 
-                                         "Failure of assertion at line 445, column 7.")
+                                         "Failure of assertion at line 459, column 7.")
                                /\ csSessionStore' = upd.store
                                /\ chCSToProvider' = CSToProvider("SignStatusReq", chVCDToCS.body.sidCS,  chVCDToCS.body.sidProv, NoBody)
                                /\ chVCDToCS' = NoMsg
@@ -2052,14 +2185,14 @@ CS_SendSignStatusReq == /\ pc[CSPid] = "CS_SendSignStatusReq"
                                         chSignToProvider, chSignToVoter, 
                                         chVoterToSign, chCSToReg, chRegToCS, 
                                         chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                        chVVDToVoter, voterScenarioIdx, 
-                                        voterPhase, voterChoice, accepted, 
-                                        voterAccept, verifiedBDOCs, 
-                                        vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                        vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
-                                        vcdCfg, csScenarioIdx, csBallotStore, 
-                                        csLatest, csDroppedBallot, csReqCnt, 
-                                        csFreshnessStore, csCfg, 
+                                        chVVDToVoter, chVoterToVVD, 
+                                        voterScenarioIdx, voterPhase, 
+                                        voterChoice, accepted, voterAccept, 
+                                        verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                        vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                        vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                        csBallotStore, csDroppedBallot, 
+                                        csReqCnt, csFreshnessStore, csCfg, 
                                         providerScenarioIdx, 
                                         providerSessionStore, 
                                         providerCertStore, provAuthSid, 
@@ -2070,13 +2203,14 @@ CS_SendSignStatusReq == /\ pc[CSPid] = "CS_SendSignStatusReq"
                                         regOcspStore, regNextOCSPIdx, 
                                         regDroppedLogEntry, vvdScenarioIdx, 
                                         vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                        vvdPendingBdoc, vvdPendingChoices, 
                                         vvdAccepted, vvdRejected, vvdCfg >>
 
 CS_RecvSignStatusRes == /\ pc[CSPid] = "CS_RecvSignStatusRes"
                         /\ chProviderToCS.tag = "SignStatusRes"
                         /\ LET session == StoreLookup(csSessionStore, chProviderToCS.body.sidCS) IN
                              /\ Assert(session # Empty, 
-                                       "Failure of assertion at line 454, column 7.")
+                                       "Failure of assertion at line 468, column 7.")
                              /\ csSessionStore' = StorePut(csSessionStore,
                                                              chProviderToCS.body.sidCS,
                                                              [session EXCEPT !.phase = "SignStatus", !.exp = PhaseSignStatusTime + csCfg.stageTTL])
@@ -2089,14 +2223,14 @@ CS_RecvSignStatusRes == /\ pc[CSPid] = "CS_RecvSignStatusRes"
                                         chSignToProvider, chSignToVoter, 
                                         chVoterToSign, chCSToReg, chRegToCS, 
                                         chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                        chVVDToVoter, voterScenarioIdx, 
-                                        voterPhase, voterChoice, accepted, 
-                                        voterAccept, verifiedBDOCs, 
-                                        vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                        vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
-                                        vcdCfg, csScenarioIdx, csBallotStore, 
-                                        csLatest, csDroppedBallot, csReqCnt, 
-                                        csFreshnessStore, csCfg, 
+                                        chVVDToVoter, chVoterToVVD, 
+                                        voterScenarioIdx, voterPhase, 
+                                        voterChoice, accepted, voterAccept, 
+                                        verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                        vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                        vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                        csBallotStore, csDroppedBallot, 
+                                        csReqCnt, csFreshnessStore, csCfg, 
                                         providerScenarioIdx, 
                                         providerSessionStore, 
                                         providerCertStore, provAuthSid, 
@@ -2107,6 +2241,7 @@ CS_RecvSignStatusRes == /\ pc[CSPid] = "CS_RecvSignStatusRes"
                                         regOcspStore, regNextOCSPIdx, 
                                         regDroppedLogEntry, vvdScenarioIdx, 
                                         vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                        vvdPendingBdoc, vvdPendingChoices, 
                                         vvdAccepted, vvdRejected, vvdCfg >>
 
 CS_RecvVoteReq == /\ pc[CSPid] = "CS_RecvVoteReq"
@@ -2114,33 +2249,34 @@ CS_RecvVoteReq == /\ pc[CSPid] = "CS_RecvVoteReq"
                   /\ LET t == PhaseVoteSubmittedTime IN
                        LET upd == VerifyAndUpdateSession(csCfg, csSessionStore, chVCDToCS.body.sidCS, "Vote", chVCDToCS.body.tok, NoVoterRef, t) IN
                          /\ Assert(upd.ok, 
-                                   "Failure of assertion at line 466, column 7.")
+                                   "Failure of assertion at line 480, column 7.")
                          /\ LET openedTok == OpenAuthToken(CSSymKey, chVCDToCS.body.tok) IN
                               LET p == chVCDToCS.body.payload IN
                                 /\ Assert(openedTok # Empty, 
-                                          "Failure of assertion at line 469, column 9.")
+                                          "Failure of assertion at line 483, column 9.")
                                 /\ Assert(openedTok[1] = p.bdoc.signerCert, 
-                                          "Failure of assertion at line 470, column 35.")
+                                          "Failure of assertion at line 484, column 35.")
                                 /\ Assert(openedTok[2] = upd.session.ctx.issuedVid, 
-                                          "Failure of assertion at line 471, column 35.")
+                                          "Failure of assertion at line 485, column 35.")
                                 /\ Assert(VerifyTrustedX509Cert(csCfg.cfg.rootCACert, p.bdoc.signerCert), 
-                                          "Failure of assertion at line 472, column 35.")
+                                          "Failure of assertion at line 486, column 35.")
                                 /\ Assert(p.bdoc.signerCert.pnoee \in DOMAIN csCfg.voterList, 
-                                          "Failure of assertion at line 473, column 35.")
+                                          "Failure of assertion at line 487, column 35.")
                                 /\ Assert(upd.session.voterId = p.bdoc.signerCert.pnoee, 
-                                          "Failure of assertion at line 474, column 35.")
+                                          "Failure of assertion at line 488, column 35.")
                                 /\ Assert(Verify(p.bdoc.signerCert.pk, p.bdoc.tbs, p.bdoc.sig), 
-                                          "Failure of assertion at line 475, column 35.")
+                                          "Failure of assertion at line 489, column 35.")
                                 /\ LET voteVid == upd.session.ctx.issuedVid IN
                                      LET tspReq == LET h == Hash(p.bdoc.sig) IN TSPReq(h, Sign(TSPClientSK, h)) IN
                                        LET ocspReq == OCSPReq(p.bdoc.signerCert) IN
                                          LET session == [upd.session EXCEPT !.ctx.voteVid = voteVid,
-                                                                             !.ctx.tspReq = LET h == Hash(p.bdoc.sig) IN TSPReq(h, Sign(TSPClientSK, h)),
-                                                                             !.ctx.ocspReq = OCSPReq(p.bdoc.signerCert)] IN
-                                           /\ csSessionStore' = StorePut(upd.store, chVCDToCS.body.sidCS, session)
-                                           /\ csBallotStore' =            StorePut(csBallotStore,
-                                                               voteVid,
-                                                               StoredVote(voteVid, upd.session.voterId, t, p.bdoc, NoTSPRes, NoOCSPRes, 0))
+                                                                             !.ctx.submitted = t,
+                                                                             !.ctx.bdoc = p.bdoc,
+                                                                             !.ctx.tspReq = tspReq,
+                                                                             !.ctx.ocspReq = ocspReq,
+                                                                             !.ctx.tspRes = NoTSPRes,
+                                                                             !.ctx.ocspRes = NoOCSPRes] IN
+                                           csSessionStore' = StorePut(upd.store, chVCDToCS.body.sidCS, session)
                   /\ pc' = [pc EXCEPT ![CSPid] = "CS_SendTSPReq"]
                   /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, 
                                   chVCDToCS, chCSToVCD, chCSToProvider, 
@@ -2148,29 +2284,30 @@ CS_RecvVoteReq == /\ pc[CSPid] = "CS_RecvVoteReq"
                                   chSignToProvider, chSignToVoter, 
                                   chVoterToSign, chCSToReg, chRegToCS, 
                                   chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                  chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                  voterChoice, accepted, voterAccept, 
-                                  verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                  vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                  vcdVoteRes, vcdCfg, csScenarioIdx, csLatest, 
-                                  csDroppedBallot, csReqCnt, csFreshnessStore, 
-                                  csCfg, providerScenarioIdx, 
+                                  chVVDToVoter, chVoterToVVD, voterScenarioIdx, 
+                                  voterPhase, voterChoice, accepted, 
+                                  voterAccept, verifiedBDOCs, vcdScenarioIdx, 
+                                  vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                  vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                  csBallotStore, csDroppedBallot, csReqCnt, 
+                                  csFreshnessStore, csCfg, providerScenarioIdx, 
                                   providerSessionStore, providerCertStore, 
                                   provAuthSid, provSignSid, signScenarioIdx, 
                                   signAuthChallenge, authPhone, signChallenge, 
                                   signPhone, regScenarioIdx, regStore, 
                                   regNextIdx, regOcspStore, regNextOCSPIdx, 
                                   regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                  vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                  vvdRejected, vvdCfg >>
+                                  vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                  vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                  vvdCfg >>
 
 CS_SendTSPReq == /\ pc[CSPid] = "CS_SendTSPReq"
                  /\ LET sid == ActiveVoteSessionSid(csSessionStore) IN
                       LET session == StoreLookup(csSessionStore, ActiveVoteSessionSid(csSessionStore)) IN
                         /\ Assert(sid # Empty, 
-                                  "Failure of assertion at line 493, column 7.")
+                                  "Failure of assertion at line 508, column 7.")
                         /\ Assert(session # Empty, 
-                                  "Failure of assertion at line 494, column 7.")
+                                  "Failure of assertion at line 509, column 7.")
                         /\ chCSToReg' = CSToReg("TSPReq", session.ctx.tspReq)
                  /\ pc' = [pc EXCEPT ![CSPid] = "CS_RecvTSPRes"]
                  /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, 
@@ -2179,47 +2316,12 @@ CS_SendTSPReq == /\ pc[CSPid] = "CS_SendTSPReq"
                                  chSignToProvider, chSignToVoter, 
                                  chVoterToSign, chRegToCS, chVCDToVVD, 
                                  chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                 voterScenarioIdx, voterPhase, voterChoice, 
-                                 accepted, voterAccept, verifiedBDOCs, 
-                                 vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                 vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
-                                 csScenarioIdx, csSessionStore, csBallotStore, 
-                                 csLatest, csDroppedBallot, csReqCnt, 
-                                 csFreshnessStore, csCfg, providerScenarioIdx, 
-                                 providerSessionStore, providerCertStore, 
-                                 provAuthSid, provSignSid, signScenarioIdx, 
-                                 signAuthChallenge, authPhone, signChallenge, 
-                                 signPhone, regScenarioIdx, regStore, 
-                                 regNextIdx, regOcspStore, regNextOCSPIdx, 
-                                 regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                 vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                 vvdRejected, vvdCfg >>
-
-CS_RecvTSPRes == /\ pc[CSPid] = "CS_RecvTSPRes"
-                 /\ chRegToCS.tag = "TSPRes"
-                 /\ LET t == PhaseTSPTime IN
-                      LET sid == ActiveVoteSessionSid(csSessionStore) IN
-                        LET session == StoreLookup(csSessionStore, ActiveVoteSessionSid(csSessionStore)) IN
-                          /\ Assert(sid # Empty, 
-                                    "Failure of assertion at line 503, column 7.")
-                          /\ Assert(session # Empty, 
-                                    "Failure of assertion at line 504, column 7.")
-                          /\ Assert(VerifyTSPCS(csCfg, session.ctx.tspReq, chRegToCS.body.payload, t), 
-                                    "Failure of assertion at line 505, column 7.")
-                          /\ csBallotStore' = [csBallotStore EXCEPT ![session.ctx.voteVid].tsp = chRegToCS.body.payload]
-                 /\ chRegToCS' = NoMsg
-                 /\ pc' = [pc EXCEPT ![CSPid] = "CS_SendOCSPReq"]
-                 /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, 
-                                 chVCDToCS, chCSToVCD, chCSToProvider, 
-                                 chProviderToCS, chProviderToSign, 
-                                 chSignToProvider, chSignToVoter, 
-                                 chVoterToSign, chCSToReg, chVCDToVVD, 
-                                 chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                 voterScenarioIdx, voterPhase, voterChoice, 
-                                 accepted, voterAccept, verifiedBDOCs, 
-                                 vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                 vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
-                                 csScenarioIdx, csSessionStore, csLatest, 
+                                 chVoterToVVD, voterScenarioIdx, voterPhase, 
+                                 voterChoice, accepted, voterAccept, 
+                                 verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                 vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                 vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                 csSessionStore, csBallotStore, 
                                  csDroppedBallot, csReqCnt, csFreshnessStore, 
                                  csCfg, providerScenarioIdx, 
                                  providerSessionStore, providerCertStore, 
@@ -2228,16 +2330,56 @@ CS_RecvTSPRes == /\ pc[CSPid] = "CS_RecvTSPRes"
                                  signPhone, regScenarioIdx, regStore, 
                                  regNextIdx, regOcspStore, regNextOCSPIdx, 
                                  regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                 vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                 vvdRejected, vvdCfg >>
+                                 vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                 vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                 vvdCfg >>
+
+CS_RecvTSPRes == /\ pc[CSPid] = "CS_RecvTSPRes"
+                 /\ chRegToCS.tag = "TSPRes"
+                 /\ LET t == PhaseTSPTime IN
+                      LET sid == ActiveVoteSessionSid(csSessionStore) IN
+                        LET session == StoreLookup(csSessionStore, ActiveVoteSessionSid(csSessionStore)) IN
+                          /\ Assert(sid # Empty, 
+                                    "Failure of assertion at line 518, column 7.")
+                          /\ Assert(session # Empty, 
+                                    "Failure of assertion at line 519, column 7.")
+                          /\ Assert(VerifyTSPCS(csCfg, session.ctx.tspReq, chRegToCS.body.payload, t), 
+                                    "Failure of assertion at line 520, column 7.")
+                          /\ csSessionStore' = StorePut(csSessionStore,
+                                                        sid,
+                                                        [session EXCEPT !.ctx.tspRes = chRegToCS.body.payload])
+                 /\ chRegToCS' = NoMsg
+                 /\ pc' = [pc EXCEPT ![CSPid] = "CS_SendOCSPReq"]
+                 /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, 
+                                 chVCDToCS, chCSToVCD, chCSToProvider, 
+                                 chProviderToCS, chProviderToSign, 
+                                 chSignToProvider, chSignToVoter, 
+                                 chVoterToSign, chCSToReg, chVCDToVVD, 
+                                 chVVDToCS, chCSToVVD, chVVDToVoter, 
+                                 chVoterToVVD, voterScenarioIdx, voterPhase, 
+                                 voterChoice, accepted, voterAccept, 
+                                 verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                 vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                 vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                 csBallotStore, csDroppedBallot, csReqCnt, 
+                                 csFreshnessStore, csCfg, providerScenarioIdx, 
+                                 providerSessionStore, providerCertStore, 
+                                 provAuthSid, provSignSid, signScenarioIdx, 
+                                 signAuthChallenge, authPhone, signChallenge, 
+                                 signPhone, regScenarioIdx, regStore, 
+                                 regNextIdx, regOcspStore, regNextOCSPIdx, 
+                                 regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
+                                 vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                 vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                 vvdCfg >>
 
 CS_SendOCSPReq == /\ pc[CSPid] = "CS_SendOCSPReq"
                   /\ LET sid == ActiveVoteSessionSid(csSessionStore) IN
                        LET session == StoreLookup(csSessionStore, ActiveVoteSessionSid(csSessionStore)) IN
                          /\ Assert(sid # Empty, 
-                                   "Failure of assertion at line 513, column 7.")
+                                   "Failure of assertion at line 530, column 7.")
                          /\ Assert(session # Empty, 
-                                   "Failure of assertion at line 514, column 7.")
+                                   "Failure of assertion at line 531, column 7.")
                          /\ chCSToReg' = CSToReg("OCSPReq", session.ctx.ocspReq)
                   /\ pc' = [pc EXCEPT ![CSPid] = "CS_RecvOCSPRes"]
                   /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, 
@@ -2246,43 +2388,51 @@ CS_SendOCSPReq == /\ pc[CSPid] = "CS_SendOCSPReq"
                                   chSignToProvider, chSignToVoter, 
                                   chVoterToSign, chRegToCS, chVCDToVVD, 
                                   chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                  voterScenarioIdx, voterPhase, voterChoice, 
-                                  accepted, voterAccept, verifiedBDOCs, 
-                                  vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                  vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
-                                  csScenarioIdx, csSessionStore, csBallotStore, 
-                                  csLatest, csDroppedBallot, csReqCnt, 
-                                  csFreshnessStore, csCfg, providerScenarioIdx, 
+                                  chVoterToVVD, voterScenarioIdx, voterPhase, 
+                                  voterChoice, accepted, voterAccept, 
+                                  verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                  vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                  vcdVoteRes, vcdCfg, csScenarioIdx, 
+                                  csSessionStore, csBallotStore, 
+                                  csDroppedBallot, csReqCnt, csFreshnessStore, 
+                                  csCfg, providerScenarioIdx, 
                                   providerSessionStore, providerCertStore, 
                                   provAuthSid, provSignSid, signScenarioIdx, 
                                   signAuthChallenge, authPhone, signChallenge, 
                                   signPhone, regScenarioIdx, regStore, 
                                   regNextIdx, regOcspStore, regNextOCSPIdx, 
                                   regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                  vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                  vvdRejected, vvdCfg >>
+                                  vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                  vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                  vvdCfg >>
 
 CS_RecvOCSPRes == /\ pc[CSPid] = "CS_RecvOCSPRes"
                   /\ chRegToCS.tag = "OCSPRes"
                   /\ LET t == PhaseOCSPTime IN
                        LET sid == ActiveVoteSessionSid(csSessionStore) IN
                          LET session == StoreLookup(csSessionStore, ActiveVoteSessionSid(csSessionStore)) IN
-                           LET ballot == StoreLookup(csBallotStore, StoreLookup(csSessionStore, ActiveVoteSessionSid(csSessionStore)).ctx.voteVid) IN
-                             /\ Assert(sid # Empty, 
-                                       "Failure of assertion at line 524, column 7.")
-                             /\ Assert(session # Empty, 
-                                       "Failure of assertion at line 525, column 7.")
-                             /\ Assert(ballot # Empty, 
-                                       "Failure of assertion at line 526, column 7.")
-                             /\ Assert(VerifyOCSPCS(csCfg, session.ctx.ocspReq, chRegToCS.body.payload), 
-                                       "Failure of assertion at line 527, column 7.")
-                             /\ Assert(chRegToCS.body.payload.t >= ballot.tsp.t, 
-                                       "Failure of assertion at line 528, column 7.")
-                             /\ LET updatedStore == StorePut(csBallotStore,
-                                                             session.ctx.voteVid,
-                                                             [ballot EXCEPT !.ocsp = chRegToCS.body.payload]) IN
-                                  /\ csBallotStore' = updatedStore
-                                  /\ csLatest' = LatestVoteForVoter(updatedStore, ballot.voterId)
+                           /\ Assert(sid # Empty, 
+                                     "Failure of assertion at line 540, column 7.")
+                           /\ Assert(session # Empty, 
+                                     "Failure of assertion at line 541, column 7.")
+                           /\ Assert(session.ctx.tspRes # NoTSPRes, 
+                                     "Failure of assertion at line 542, column 7.")
+                           /\ Assert(VerifyOCSPCS(csCfg, session.ctx.ocspReq, chRegToCS.body.payload), 
+                                     "Failure of assertion at line 543, column 7.")
+                           /\ Assert(chRegToCS.body.payload.t >= session.ctx.tspRes.t, 
+                                     "Failure of assertion at line 544, column 7.")
+                           /\ LET ballot == RegisteredBallot(session.ctx.voteVid,
+                                                             session.voterId,
+                                                             session.ctx.submitted,
+                                                             session.ctx.tspRes.t,
+                                                             session.ctx.bdoc,
+                                                             session.ctx.tspRes,
+                                                             chRegToCS.body.payload,
+                                                             0,
+                                                             FALSE) IN
+                                LET updatedSession == [session EXCEPT !.ctx.ocspRes = chRegToCS.body.payload] IN
+                                  /\ csSessionStore' = StorePut(csSessionStore, sid, updatedSession)
+                                  /\ csBallotStore' = StorePut(csBallotStore, session.ctx.voteVid, ballot)
                   /\ chRegToCS' = NoMsg
                   /\ pc' = [pc EXCEPT ![CSPid] = "CS_SendVoteRes"]
                   /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, 
@@ -2291,11 +2441,11 @@ CS_RecvOCSPRes == /\ pc[CSPid] = "CS_RecvOCSPRes"
                                   chSignToProvider, chSignToVoter, 
                                   chVoterToSign, chCSToReg, chVCDToVVD, 
                                   chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                  voterScenarioIdx, voterPhase, voterChoice, 
-                                  accepted, voterAccept, verifiedBDOCs, 
-                                  vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                  vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
-                                  csScenarioIdx, csSessionStore, 
+                                  chVoterToVVD, voterScenarioIdx, voterPhase, 
+                                  voterChoice, accepted, voterAccept, 
+                                  verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
+                                  vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                  vcdVoteRes, vcdCfg, csScenarioIdx, 
                                   csDroppedBallot, csReqCnt, csFreshnessStore, 
                                   csCfg, providerScenarioIdx, 
                                   providerSessionStore, providerCertStore, 
@@ -2304,19 +2454,20 @@ CS_RecvOCSPRes == /\ pc[CSPid] = "CS_RecvOCSPRes"
                                   signPhone, regScenarioIdx, regStore, 
                                   regNextIdx, regOcspStore, regNextOCSPIdx, 
                                   regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                  vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                  vvdRejected, vvdCfg >>
+                                  vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                  vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                  vvdCfg >>
 
 CS_SendVoteRes == /\ pc[CSPid] = "CS_SendVoteRes"
                   /\ LET sid == ActiveVoteSessionSid(csSessionStore) IN
                        LET session == StoreLookup(csSessionStore, ActiveVoteSessionSid(csSessionStore)) IN
                          LET ballot == StoreLookup(csBallotStore, StoreLookup(csSessionStore, ActiveVoteSessionSid(csSessionStore)).ctx.voteVid) IN
                            /\ Assert(sid # Empty, 
-                                     "Failure of assertion at line 542, column 7.")
+                                     "Failure of assertion at line 565, column 7.")
                            /\ Assert(session # Empty, 
-                                     "Failure of assertion at line 543, column 7.")
+                                     "Failure of assertion at line 566, column 7.")
                            /\ Assert(ballot # Empty, 
-                                     "Failure of assertion at line 544, column 7.")
+                                     "Failure of assertion at line 567, column 7.")
                            /\ chCSToVCD' = CSToVCD("VoteRes", sid, NoInt, VoteRes(session.ctx.voteVid, ballot.tsp, ballot.ocsp))
                            /\ chVCDToCS' = NoMsg
                   /\ pc' = [pc EXCEPT ![CSPid] = "CS_RecvVerifyReq"]
@@ -2325,12 +2476,12 @@ CS_SendVoteRes == /\ pc[CSPid] = "CS_SendVoteRes"
                                   chProviderToSign, chSignToProvider, 
                                   chSignToVoter, chVoterToSign, chCSToReg, 
                                   chRegToCS, chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                  chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                  voterChoice, accepted, voterAccept, 
-                                  verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                  vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                  chVVDToVoter, chVoterToVVD, voterScenarioIdx, 
+                                  voterPhase, voterChoice, accepted, 
+                                  voterAccept, verifiedBDOCs, vcdScenarioIdx, 
+                                  vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, 
                                   vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                  csSessionStore, csBallotStore, csLatest, 
+                                  csSessionStore, csBallotStore, 
                                   csDroppedBallot, csReqCnt, csFreshnessStore, 
                                   csCfg, providerScenarioIdx, 
                                   providerSessionStore, providerCertStore, 
@@ -2339,27 +2490,31 @@ CS_SendVoteRes == /\ pc[CSPid] = "CS_SendVoteRes"
                                   signPhone, regScenarioIdx, regStore, 
                                   regNextIdx, regOcspStore, regNextOCSPIdx, 
                                   regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                  vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                  vvdRejected, vvdCfg >>
+                                  vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                  vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                  vvdCfg >>
 
 CS_RecvVerifyReq == /\ pc[CSPid] = "CS_RecvVerifyReq"
                     /\ chVVDToCS.tag = "VerifyReq"
                     /\ LET t == PhaseVerifyTime IN
                          LET upd == VerifyAndUpdateSession(csCfg, csSessionStore, chVVDToCS.body.sidCS, "Verify", Empty, NoVoterRef, t) IN
                            LET ballot == StoreLookup(csBallotStore, chVVDToCS.body.vid) IN
-                             IF /\ upd.ok
-                                /\ ballot # Empty
-                                /\ chVVDToCS.body.vid = csLatest.vid
-                                /\ ballot.verCount < csCfg.verifyCountLimit
-                                /\ t <= ballot.submitted + csCfg.verifyWindow
-                                /\ ballot.tsp # NoTSPRes
-                                /\ ballot.ocsp # NoOCSPRes
-                                THEN /\ csSessionStore' = upd.store
-                                     /\ csBallotStore' = [csBallotStore EXCEPT ![chVVDToCS.body.vid].verCount = @ + 1]
-                                     /\ chCSToVVD' = CSToVVD("VerifyRes", VerifyRes(ballot.bdoc, ballot.tsp, ballot.ocsp, csCfg.cfg.choices))
-                                ELSE /\ TRUE
-                                     /\ UNCHANGED << chCSToVVD, csSessionStore, 
-                                                     csBallotStore >>
+                             LET latest == LET b == StoreLookup(csBallotStore, chVVDToCS.body.vid)
+                                           IN IF b # Empty THEN LatestRegisteredBallot(csBallotStore, b.voterId) ELSE EmptyRegisteredBallot IN
+                               IF /\ upd.ok
+                                  /\ ballot # Empty
+                                  /\ chVVDToCS.body.vid = latest.vid
+                                  /\ ballot.verCount < csCfg.verifyCountLimit
+                                  /\ t <= ballot.submitted + csCfg.verifyWindow
+                                  /\ ballot.tsp # NoTSPRes
+                                  /\ ballot.ocsp # NoOCSPRes
+                                  THEN /\ csSessionStore' = upd.store
+                                       /\ csBallotStore' = [csBallotStore EXCEPT ![chVVDToCS.body.vid].verCount = @ + 1]
+                                       /\ chCSToVVD' = CSToVVD("VerifyRes", VerifyRes(ballot.bdoc, ballot.tsp, ballot.ocsp, csCfg.cfg.choices))
+                                  ELSE /\ TRUE
+                                       /\ UNCHANGED << chCSToVVD, 
+                                                       csSessionStore, 
+                                                       csBallotStore >>
                     /\ chVVDToCS' = NoMsg
                     /\ pc' = [pc EXCEPT ![CSPid] = "CS_DropBallot"]
                     /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, 
@@ -2367,13 +2522,13 @@ CS_RecvVerifyReq == /\ pc[CSPid] = "CS_RecvVerifyReq"
                                     chProviderToCS, chProviderToSign, 
                                     chSignToProvider, chSignToVoter, 
                                     chVoterToSign, chCSToReg, chRegToCS, 
-                                    chVCDToVVD, chVVDToVoter, voterScenarioIdx, 
-                                    voterPhase, voterChoice, accepted, 
-                                    voterAccept, verifiedBDOCs, vcdScenarioIdx, 
-                                    vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                    vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                    csLatest, csDroppedBallot, csReqCnt, 
-                                    csFreshnessStore, csCfg, 
+                                    chVCDToVVD, chVVDToVoter, chVoterToVVD, 
+                                    voterScenarioIdx, voterPhase, voterChoice, 
+                                    accepted, voterAccept, verifiedBDOCs, 
+                                    vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                    vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                    vcdCfg, csScenarioIdx, csDroppedBallot, 
+                                    csReqCnt, csFreshnessStore, csCfg, 
                                     providerScenarioIdx, providerSessionStore, 
                                     providerCertStore, provAuthSid, 
                                     provSignSid, signScenarioIdx, 
@@ -2382,28 +2537,27 @@ CS_RecvVerifyReq == /\ pc[CSPid] = "CS_RecvVerifyReq"
                                     regStore, regNextIdx, regOcspStore, 
                                     regNextOCSPIdx, regDroppedLogEntry, 
                                     vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                                    vvdChoice, vvdAccepted, vvdRejected, 
-                                    vvdCfg >>
+                                    vvdChoice, vvdPendingBdoc, 
+                                    vvdPendingChoices, vvdAccepted, 
+                                    vvdRejected, vvdCfg >>
 
 CS_DropBallot == /\ pc[CSPid] = "CS_DropBallot"
                  /\ IF AllowVotingFaultInjection
                        THEN /\ \/ /\ TRUE
-                                  /\ UNCHANGED <<csBallotStore, csLatest, csDroppedBallot>>
-                               \/ /\ IF /\ csLatest.vid # NoInt /\ csLatest.vid \in DOMAIN csBallotStore
-                                        THEN /\ LET ballot == StoreLookup(csBallotStore, csLatest.vid) IN
-                                                  LET updatedStore == StoreDelete(csBallotStore, csLatest.vid) IN
-                                                    /\ Assert(ballot # Empty, 
-                                                              "Failure of assertion at line 578, column 13.")
-                                                    /\ csBallotStore' = updatedStore
-                                                    /\ csLatest' = LatestVoteForVoter(updatedStore, ballot.voterId)
-                                             /\ csDroppedBallot' = TRUE
-                                        ELSE /\ TRUE
-                                             /\ UNCHANGED << csBallotStore, 
-                                                             csLatest, 
-                                                             csDroppedBallot >>
+                                  /\ UNCHANGED <<csBallotStore, csDroppedBallot>>
+                               \/ /\ LET anyVid == IF DOMAIN csBallotStore # {} THEN CHOOSE v \in DOMAIN csBallotStore : TRUE ELSE NoInt IN
+                                       IF anyVid # NoInt
+                                          THEN /\ LET latest == LatestRegisteredBallot(csBallotStore, StoreLookup(csBallotStore, anyVid).voterId) IN
+                                                    LET updatedStore == StoreDelete(csBallotStore, LatestRegisteredBallot(csBallotStore, StoreLookup(csBallotStore, anyVid).voterId).vid) IN
+                                                      /\ Assert(latest # EmptyRegisteredBallot, 
+                                                                "Failure of assertion at line 604, column 13.")
+                                                      /\ csBallotStore' = updatedStore
+                                               /\ csDroppedBallot' = TRUE
+                                          ELSE /\ TRUE
+                                               /\ UNCHANGED << csBallotStore, 
+                                                               csDroppedBallot >>
                        ELSE /\ TRUE
-                            /\ UNCHANGED << csBallotStore, csLatest, 
-                                            csDroppedBallot >>
+                            /\ UNCHANGED << csBallotStore, csDroppedBallot >>
                  /\ pc' = [pc EXCEPT ![CSPid] = "CS_Done"]
                  /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, 
                                  chVCDToCS, chCSToVCD, chCSToProvider, 
@@ -2411,10 +2565,10 @@ CS_DropBallot == /\ pc[CSPid] = "CS_DropBallot"
                                  chSignToProvider, chSignToVoter, 
                                  chVoterToSign, chCSToReg, chRegToCS, 
                                  chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                 chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                 voterChoice, accepted, voterAccept, 
-                                 verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                 vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                 chVVDToVoter, chVoterToVVD, voterScenarioIdx, 
+                                 voterPhase, voterChoice, accepted, 
+                                 voterAccept, verifiedBDOCs, vcdScenarioIdx, 
+                                 vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, 
                                  vcdVoteRes, vcdCfg, csScenarioIdx, 
                                  csSessionStore, csReqCnt, csFreshnessStore, 
                                  csCfg, providerScenarioIdx, 
@@ -2424,23 +2578,23 @@ CS_DropBallot == /\ pc[CSPid] = "CS_DropBallot"
                                  signPhone, regScenarioIdx, regStore, 
                                  regNextIdx, regOcspStore, regNextOCSPIdx, 
                                  regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                 vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                 vvdRejected, vvdCfg >>
+                                 vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                 vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                 vvdCfg >>
 
 CS_Done == /\ pc[CSPid] = "CS_Done"
            /\ IF csScenarioIdx < Len(VotingScenario)
                  THEN /\ scenarioIdx > csScenarioIdx
                       /\ csScenarioIdx' = scenarioIdx
-                      /\ csLatest' = EmptyLatestVote
                       /\ pc' = [pc EXCEPT ![CSPid] = "CS_RecvAuthReq"]
                  ELSE /\ TRUE
                       /\ pc' = [pc EXCEPT ![CSPid] = "Done"]
-                      /\ UNCHANGED << csScenarioIdx, csLatest >>
+                      /\ UNCHANGED csScenarioIdx
            /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, chVCDToCS, 
                            chCSToVCD, chCSToProvider, chProviderToCS, 
                            chProviderToSign, chSignToProvider, chSignToVoter, 
                            chVoterToSign, chCSToReg, chRegToCS, chVCDToVVD, 
-                           chVVDToCS, chCSToVVD, chVVDToVoter, 
+                           chVVDToCS, chCSToVVD, chVVDToVoter, chVoterToVVD, 
                            voterScenarioIdx, voterPhase, voterChoice, accepted, 
                            voterAccept, verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
                            vcdChoice, vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
@@ -2452,8 +2606,8 @@ CS_Done == /\ pc[CSPid] = "CS_Done"
                            signChallenge, signPhone, regScenarioIdx, regStore, 
                            regNextIdx, regOcspStore, regNextOCSPIdx, 
                            regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                           vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                           vvdRejected, vvdCfg >>
+                           vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                           vvdPendingChoices, vvdAccepted, vvdRejected, vvdCfg >>
 
 CSProc == CS_RecvAuthReq \/ CS_RecvAuthStarted \/ CS_SendAuthStatusReq
              \/ CS_RecvAuthStatusRes \/ CS_RecvChoicesReq
@@ -2468,7 +2622,7 @@ Provider_RecvAuthStart == /\ pc[ProviderPid] = "Provider_RecvAuthStart"
                           /\ chCSToProvider.tag = "AuthStart"
                           /\ LET p == chCSToProvider.body.payload IN
                                /\ Assert(ProviderSidsForPhone(providerSessionStore, p.voterRef.phone, "Auth") = {}, 
-                                         "Failure of assertion at line 613, column 7.")
+                                         "Failure of assertion at line 639, column 7.")
                                /\ providerSessionStore' = StorePut(providerSessionStore, provAuthSid, ProviderEntry(provAuthSid, p.voterRef.phone, "Auth", p.challenge, Empty))
                                /\ chProviderToSign' = ProviderToSign("AuthChallenge", [challenge |-> p.challenge, phone |-> p.voterRef.phone])
                                /\ chProviderToCS' = ProviderToCS("AuthStarted", chCSToProvider.body.sidCS, provAuthSid, [challenge |-> p.challenge])
@@ -2479,15 +2633,15 @@ Provider_RecvAuthStart == /\ pc[ProviderPid] = "Provider_RecvAuthStart"
                                           chSignToProvider, chSignToVoter, 
                                           chVoterToSign, chCSToReg, chRegToCS, 
                                           chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                          chVVDToVoter, voterScenarioIdx, 
-                                          voterPhase, voterChoice, accepted, 
-                                          voterAccept, verifiedBDOCs, 
-                                          vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                          vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
-                                          vcdCfg, csScenarioIdx, 
-                                          csSessionStore, csBallotStore, 
-                                          csLatest, csDroppedBallot, csReqCnt, 
-                                          csFreshnessStore, csCfg, 
+                                          chVVDToVoter, chVoterToVVD, 
+                                          voterScenarioIdx, voterPhase, 
+                                          voterChoice, accepted, voterAccept, 
+                                          verifiedBDOCs, vcdScenarioIdx, 
+                                          vcdCtx, vcdChoice, vcdVoteBDOC, 
+                                          vcdVoteReq, vcdVoteRes, vcdCfg, 
+                                          csScenarioIdx, csSessionStore, 
+                                          csBallotStore, csDroppedBallot, 
+                                          csReqCnt, csFreshnessStore, csCfg, 
                                           providerScenarioIdx, 
                                           providerCertStore, provAuthSid, 
                                           provSignSid, signScenarioIdx, 
@@ -2497,6 +2651,7 @@ Provider_RecvAuthStart == /\ pc[ProviderPid] = "Provider_RecvAuthStart"
                                           regOcspStore, regNextOCSPIdx, 
                                           regDroppedLogEntry, vvdScenarioIdx, 
                                           vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                          vvdPendingBdoc, vvdPendingChoices, 
                                           vvdAccepted, vvdRejected, vvdCfg >>
 
 Provider_RecvAuthSignature == /\ pc[ProviderPid] = "Provider_RecvAuthSignature"
@@ -2504,11 +2659,11 @@ Provider_RecvAuthSignature == /\ pc[ProviderPid] = "Provider_RecvAuthSignature"
                               /\ LET sid == ProviderSidForPhone(providerSessionStore, chSignToProvider.body.payload.phone, "Auth") IN
                                    LET entry == StoreLookup(providerSessionStore, sid) IN
                                      /\ Assert(sid # NoInt, 
-                                               "Failure of assertion at line 624, column 7.")
+                                               "Failure of assertion at line 650, column 7.")
                                      /\ Assert(entry # Empty, 
-                                               "Failure of assertion at line 625, column 7.")
+                                               "Failure of assertion at line 651, column 7.")
                                      /\ Assert(chSignToProvider.body.payload.phone = entry.phone, 
-                                               "Failure of assertion at line 626, column 7.")
+                                               "Failure of assertion at line 652, column 7.")
                                      /\ providerSessionStore' = StorePut(providerSessionStore,
                                                                                    sid,
                                                                                    [entry EXCEPT !.sig = chSignToProvider.body.payload.sig])
@@ -2521,17 +2676,17 @@ Provider_RecvAuthSignature == /\ pc[ProviderPid] = "Provider_RecvAuthSignature"
                                               chSignToVoter, chVoterToSign, 
                                               chCSToReg, chRegToCS, chVCDToVVD, 
                                               chVVDToCS, chCSToVVD, 
-                                              chVVDToVoter, voterScenarioIdx, 
-                                              voterPhase, voterChoice, 
-                                              accepted, voterAccept, 
-                                              verifiedBDOCs, vcdScenarioIdx, 
-                                              vcdCtx, vcdChoice, vcdVoteBDOC, 
+                                              chVVDToVoter, chVoterToVVD, 
+                                              voterScenarioIdx, voterPhase, 
+                                              voterChoice, accepted, 
+                                              voterAccept, verifiedBDOCs, 
+                                              vcdScenarioIdx, vcdCtx, 
+                                              vcdChoice, vcdVoteBDOC, 
                                               vcdVoteReq, vcdVoteRes, vcdCfg, 
                                               csScenarioIdx, csSessionStore, 
-                                              csBallotStore, csLatest, 
-                                              csDroppedBallot, csReqCnt, 
-                                              csFreshnessStore, csCfg, 
-                                              providerScenarioIdx, 
+                                              csBallotStore, csDroppedBallot, 
+                                              csReqCnt, csFreshnessStore, 
+                                              csCfg, providerScenarioIdx, 
                                               providerCertStore, provAuthSid, 
                                               provSignSid, signScenarioIdx, 
                                               signAuthChallenge, authPhone, 
@@ -2541,20 +2696,22 @@ Provider_RecvAuthSignature == /\ pc[ProviderPid] = "Provider_RecvAuthSignature"
                                               regNextOCSPIdx, 
                                               regDroppedLogEntry, 
                                               vvdScenarioIdx, vvdSidCS, vvdVid, 
-                                              vvdRand, vvdChoice, vvdAccepted, 
+                                              vvdRand, vvdChoice, 
+                                              vvdPendingBdoc, 
+                                              vvdPendingChoices, vvdAccepted, 
                                               vvdRejected, vvdCfg >>
 
 Provider_RecvAuthStatusReq == /\ pc[ProviderPid] = "Provider_RecvAuthStatusReq"
                               /\ chCSToProvider.tag = "AuthStatusReq"
                               /\ LET entry == StoreLookup(providerSessionStore, chCSToProvider.body.sidProv) IN
                                    /\ Assert(entry # Empty, 
-                                             "Failure of assertion at line 636, column 7.")
+                                             "Failure of assertion at line 662, column 7.")
                                    /\ Assert(chCSToProvider.body.sidProv = entry.sidProv, 
-                                             "Failure of assertion at line 637, column 7.")
+                                             "Failure of assertion at line 663, column 7.")
                                    /\ Assert(entry.sig # Empty, 
-                                             "Failure of assertion at line 638, column 7.")
+                                             "Failure of assertion at line 664, column 7.")
                                    /\ Assert(entry.phone \in DOMAIN providerCertStore, 
-                                             "Failure of assertion at line 639, column 7.")
+                                             "Failure of assertion at line 665, column 7.")
                                    /\ chProviderToCS' = ProviderToCS("AuthStatusRes", chCSToProvider.body.sidCS, entry.sidProv, [cert |-> providerCertStore[entry.phone], sig |-> entry.sig])
                                    /\ chCSToProvider' = NoMsg
                               /\ pc' = [pc EXCEPT ![ProviderPid] = "Provider_RecvGetCertReq"]
@@ -2565,17 +2722,16 @@ Provider_RecvAuthStatusReq == /\ pc[ProviderPid] = "Provider_RecvAuthStatusReq"
                                               chVoterToSign, chCSToReg, 
                                               chRegToCS, chVCDToVVD, chVVDToCS, 
                                               chCSToVVD, chVVDToVoter, 
-                                              voterScenarioIdx, voterPhase, 
-                                              voterChoice, accepted, 
-                                              voterAccept, verifiedBDOCs, 
-                                              vcdScenarioIdx, vcdCtx, 
-                                              vcdChoice, vcdVoteBDOC, 
+                                              chVoterToVVD, voterScenarioIdx, 
+                                              voterPhase, voterChoice, 
+                                              accepted, voterAccept, 
+                                              verifiedBDOCs, vcdScenarioIdx, 
+                                              vcdCtx, vcdChoice, vcdVoteBDOC, 
                                               vcdVoteReq, vcdVoteRes, vcdCfg, 
                                               csScenarioIdx, csSessionStore, 
-                                              csBallotStore, csLatest, 
-                                              csDroppedBallot, csReqCnt, 
-                                              csFreshnessStore, csCfg, 
-                                              providerScenarioIdx, 
+                                              csBallotStore, csDroppedBallot, 
+                                              csReqCnt, csFreshnessStore, 
+                                              csCfg, providerScenarioIdx, 
                                               providerSessionStore, 
                                               providerCertStore, provAuthSid, 
                                               provSignSid, signScenarioIdx, 
@@ -2586,14 +2742,16 @@ Provider_RecvAuthStatusReq == /\ pc[ProviderPid] = "Provider_RecvAuthStatusReq"
                                               regNextOCSPIdx, 
                                               regDroppedLogEntry, 
                                               vvdScenarioIdx, vvdSidCS, vvdVid, 
-                                              vvdRand, vvdChoice, vvdAccepted, 
+                                              vvdRand, vvdChoice, 
+                                              vvdPendingBdoc, 
+                                              vvdPendingChoices, vvdAccepted, 
                                               vvdRejected, vvdCfg >>
 
 Provider_RecvGetCertReq == /\ pc[ProviderPid] = "Provider_RecvGetCertReq"
                            /\ chCSToProvider.tag = "GetCertReq"
                            /\ LET phone == chCSToProvider.body.payload.phone IN
                                 /\ Assert(phone \in DOMAIN providerCertStore, 
-                                          "Failure of assertion at line 647, column 7.")
+                                          "Failure of assertion at line 673, column 7.")
                                 /\ chProviderToCS' = ProviderToCS("GetCertRes", chCSToProvider.body.sidCS, NoInt, providerCertStore[phone])
                                 /\ chCSToProvider' = NoMsg
                            /\ pc' = [pc EXCEPT ![ProviderPid] = "Provider_RecvSignStart"]
@@ -2603,13 +2761,13 @@ Provider_RecvGetCertReq == /\ pc[ProviderPid] = "Provider_RecvGetCertReq"
                                            chSignToVoter, chVoterToSign, 
                                            chCSToReg, chRegToCS, chVCDToVVD, 
                                            chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                           voterScenarioIdx, voterPhase, 
-                                           voterChoice, accepted, voterAccept, 
-                                           verifiedBDOCs, vcdScenarioIdx, 
-                                           vcdCtx, vcdChoice, vcdVoteBDOC, 
-                                           vcdVoteReq, vcdVoteRes, vcdCfg, 
-                                           csScenarioIdx, csSessionStore, 
-                                           csBallotStore, csLatest, 
+                                           chVoterToVVD, voterScenarioIdx, 
+                                           voterPhase, voterChoice, accepted, 
+                                           voterAccept, verifiedBDOCs, 
+                                           vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                           vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                           vcdCfg, csScenarioIdx, 
+                                           csSessionStore, csBallotStore, 
                                            csDroppedBallot, csReqCnt, 
                                            csFreshnessStore, csCfg, 
                                            providerScenarioIdx, 
@@ -2622,16 +2780,17 @@ Provider_RecvGetCertReq == /\ pc[ProviderPid] = "Provider_RecvGetCertReq"
                                            regNextIdx, regOcspStore, 
                                            regNextOCSPIdx, regDroppedLogEntry, 
                                            vvdScenarioIdx, vvdSidCS, vvdVid, 
-                                           vvdRand, vvdChoice, vvdAccepted, 
+                                           vvdRand, vvdChoice, vvdPendingBdoc, 
+                                           vvdPendingChoices, vvdAccepted, 
                                            vvdRejected, vvdCfg >>
 
 Provider_RecvSignStart == /\ pc[ProviderPid] = "Provider_RecvSignStart"
                           /\ chCSToProvider.tag = "SignStart"
                           /\ LET p == chCSToProvider.body.payload IN
                                /\ Assert(ProviderSidsForPhone(providerSessionStore, p.voterRef.phone, "Sign") = {}, 
-                                         "Failure of assertion at line 655, column 7.")
+                                         "Failure of assertion at line 681, column 7.")
                                /\ Assert(p.voterRef.phone \in DOMAIN providerCertStore, 
-                                         "Failure of assertion at line 656, column 7.")
+                                         "Failure of assertion at line 682, column 7.")
                                /\ providerSessionStore' = StorePut(providerSessionStore, provSignSid, ProviderEntry(provSignSid, p.voterRef.phone, "Sign", p.challenge, Empty))
                                /\ chProviderToSign' = ProviderToSign("SignChallenge", [challenge |-> p.challenge, cert |-> providerCertStore[p.voterRef.phone], phone |-> p.voterRef.phone])
                                /\ chProviderToCS' = ProviderToCS("SignStarted", chCSToProvider.body.sidCS, provSignSid, [challenge |-> p.challenge])
@@ -2642,15 +2801,15 @@ Provider_RecvSignStart == /\ pc[ProviderPid] = "Provider_RecvSignStart"
                                           chSignToProvider, chSignToVoter, 
                                           chVoterToSign, chCSToReg, chRegToCS, 
                                           chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                          chVVDToVoter, voterScenarioIdx, 
-                                          voterPhase, voterChoice, accepted, 
-                                          voterAccept, verifiedBDOCs, 
-                                          vcdScenarioIdx, vcdCtx, vcdChoice, 
-                                          vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
-                                          vcdCfg, csScenarioIdx, 
-                                          csSessionStore, csBallotStore, 
-                                          csLatest, csDroppedBallot, csReqCnt, 
-                                          csFreshnessStore, csCfg, 
+                                          chVVDToVoter, chVoterToVVD, 
+                                          voterScenarioIdx, voterPhase, 
+                                          voterChoice, accepted, voterAccept, 
+                                          verifiedBDOCs, vcdScenarioIdx, 
+                                          vcdCtx, vcdChoice, vcdVoteBDOC, 
+                                          vcdVoteReq, vcdVoteRes, vcdCfg, 
+                                          csScenarioIdx, csSessionStore, 
+                                          csBallotStore, csDroppedBallot, 
+                                          csReqCnt, csFreshnessStore, csCfg, 
                                           providerScenarioIdx, 
                                           providerCertStore, provAuthSid, 
                                           provSignSid, signScenarioIdx, 
@@ -2660,6 +2819,7 @@ Provider_RecvSignStart == /\ pc[ProviderPid] = "Provider_RecvSignStart"
                                           regOcspStore, regNextOCSPIdx, 
                                           regDroppedLogEntry, vvdScenarioIdx, 
                                           vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                          vvdPendingBdoc, vvdPendingChoices, 
                                           vvdAccepted, vvdRejected, vvdCfg >>
 
 Provider_RecvSignSignature == /\ pc[ProviderPid] = "Provider_RecvSignSignature"
@@ -2667,11 +2827,11 @@ Provider_RecvSignSignature == /\ pc[ProviderPid] = "Provider_RecvSignSignature"
                               /\ LET sid == ProviderSidForPhone(providerSessionStore, chSignToProvider.body.payload.phone, "Sign") IN
                                    LET entry == StoreLookup(providerSessionStore, sid) IN
                                      /\ Assert(sid # NoInt, 
-                                               "Failure of assertion at line 667, column 7.")
+                                               "Failure of assertion at line 693, column 7.")
                                      /\ Assert(entry # Empty, 
-                                               "Failure of assertion at line 668, column 7.")
+                                               "Failure of assertion at line 694, column 7.")
                                      /\ Assert(chSignToProvider.body.payload.phone = entry.phone, 
-                                               "Failure of assertion at line 669, column 7.")
+                                               "Failure of assertion at line 695, column 7.")
                                      /\ providerSessionStore' = StorePut(providerSessionStore,
                                                                                    sid,
                                                                                    [entry EXCEPT !.sig = chSignToProvider.body.payload.sig])
@@ -2684,17 +2844,17 @@ Provider_RecvSignSignature == /\ pc[ProviderPid] = "Provider_RecvSignSignature"
                                               chSignToVoter, chVoterToSign, 
                                               chCSToReg, chRegToCS, chVCDToVVD, 
                                               chVVDToCS, chCSToVVD, 
-                                              chVVDToVoter, voterScenarioIdx, 
-                                              voterPhase, voterChoice, 
-                                              accepted, voterAccept, 
-                                              verifiedBDOCs, vcdScenarioIdx, 
-                                              vcdCtx, vcdChoice, vcdVoteBDOC, 
+                                              chVVDToVoter, chVoterToVVD, 
+                                              voterScenarioIdx, voterPhase, 
+                                              voterChoice, accepted, 
+                                              voterAccept, verifiedBDOCs, 
+                                              vcdScenarioIdx, vcdCtx, 
+                                              vcdChoice, vcdVoteBDOC, 
                                               vcdVoteReq, vcdVoteRes, vcdCfg, 
                                               csScenarioIdx, csSessionStore, 
-                                              csBallotStore, csLatest, 
-                                              csDroppedBallot, csReqCnt, 
-                                              csFreshnessStore, csCfg, 
-                                              providerScenarioIdx, 
+                                              csBallotStore, csDroppedBallot, 
+                                              csReqCnt, csFreshnessStore, 
+                                              csCfg, providerScenarioIdx, 
                                               providerCertStore, provAuthSid, 
                                               provSignSid, signScenarioIdx, 
                                               signAuthChallenge, authPhone, 
@@ -2704,18 +2864,20 @@ Provider_RecvSignSignature == /\ pc[ProviderPid] = "Provider_RecvSignSignature"
                                               regNextOCSPIdx, 
                                               regDroppedLogEntry, 
                                               vvdScenarioIdx, vvdSidCS, vvdVid, 
-                                              vvdRand, vvdChoice, vvdAccepted, 
+                                              vvdRand, vvdChoice, 
+                                              vvdPendingBdoc, 
+                                              vvdPendingChoices, vvdAccepted, 
                                               vvdRejected, vvdCfg >>
 
 Provider_RecvSignStatusReq == /\ pc[ProviderPid] = "Provider_RecvSignStatusReq"
                               /\ chCSToProvider.tag = "SignStatusReq"
                               /\ LET entry == StoreLookup(providerSessionStore, chCSToProvider.body.sidProv) IN
                                    /\ Assert(entry # Empty, 
-                                             "Failure of assertion at line 679, column 7.")
+                                             "Failure of assertion at line 705, column 7.")
                                    /\ Assert(chCSToProvider.body.sidProv = entry.sidProv, 
-                                             "Failure of assertion at line 680, column 7.")
+                                             "Failure of assertion at line 706, column 7.")
                                    /\ Assert(entry.sig # Empty, 
-                                             "Failure of assertion at line 681, column 7.")
+                                             "Failure of assertion at line 707, column 7.")
                                    /\ chProviderToCS' = ProviderToCS("SignStatusRes", chCSToProvider.body.sidCS, entry.sidProv, entry.sig)
                                    /\ chCSToProvider' = NoMsg
                               /\ pc' = [pc EXCEPT ![ProviderPid] = "Provider_Done"]
@@ -2726,17 +2888,16 @@ Provider_RecvSignStatusReq == /\ pc[ProviderPid] = "Provider_RecvSignStatusReq"
                                               chVoterToSign, chCSToReg, 
                                               chRegToCS, chVCDToVVD, chVVDToCS, 
                                               chCSToVVD, chVVDToVoter, 
-                                              voterScenarioIdx, voterPhase, 
-                                              voterChoice, accepted, 
-                                              voterAccept, verifiedBDOCs, 
-                                              vcdScenarioIdx, vcdCtx, 
-                                              vcdChoice, vcdVoteBDOC, 
+                                              chVoterToVVD, voterScenarioIdx, 
+                                              voterPhase, voterChoice, 
+                                              accepted, voterAccept, 
+                                              verifiedBDOCs, vcdScenarioIdx, 
+                                              vcdCtx, vcdChoice, vcdVoteBDOC, 
                                               vcdVoteReq, vcdVoteRes, vcdCfg, 
                                               csScenarioIdx, csSessionStore, 
-                                              csBallotStore, csLatest, 
-                                              csDroppedBallot, csReqCnt, 
-                                              csFreshnessStore, csCfg, 
-                                              providerScenarioIdx, 
+                                              csBallotStore, csDroppedBallot, 
+                                              csReqCnt, csFreshnessStore, 
+                                              csCfg, providerScenarioIdx, 
                                               providerSessionStore, 
                                               providerCertStore, provAuthSid, 
                                               provSignSid, signScenarioIdx, 
@@ -2747,7 +2908,9 @@ Provider_RecvSignStatusReq == /\ pc[ProviderPid] = "Provider_RecvSignStatusReq"
                                               regNextOCSPIdx, 
                                               regDroppedLogEntry, 
                                               vvdScenarioIdx, vvdSidCS, vvdVid, 
-                                              vvdRand, vvdChoice, vvdAccepted, 
+                                              vvdRand, vvdChoice, 
+                                              vvdPendingBdoc, 
+                                              vvdPendingChoices, vvdAccepted, 
                                               vvdRejected, vvdCfg >>
 
 Provider_Done == /\ pc[ProviderPid] = "Provider_Done"
@@ -2766,12 +2929,12 @@ Provider_Done == /\ pc[ProviderPid] = "Provider_Done"
                                  chSignToProvider, chSignToVoter, 
                                  chVoterToSign, chCSToReg, chRegToCS, 
                                  chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                 chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                 voterChoice, accepted, voterAccept, 
-                                 verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                 vcdChoice, vcdVoteBDOC, vcdVoteReq, 
+                                 chVVDToVoter, chVoterToVVD, voterScenarioIdx, 
+                                 voterPhase, voterChoice, accepted, 
+                                 voterAccept, verifiedBDOCs, vcdScenarioIdx, 
+                                 vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, 
                                  vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                 csSessionStore, csBallotStore, csLatest, 
+                                 csSessionStore, csBallotStore, 
                                  csDroppedBallot, csReqCnt, csFreshnessStore, 
                                  csCfg, providerCertStore, provAuthSid, 
                                  provSignSid, signScenarioIdx, 
@@ -2779,8 +2942,9 @@ Provider_Done == /\ pc[ProviderPid] = "Provider_Done"
                                  signPhone, regScenarioIdx, regStore, 
                                  regNextIdx, regOcspStore, regNextOCSPIdx, 
                                  regDroppedLogEntry, vvdScenarioIdx, vvdSidCS, 
-                                 vvdVid, vvdRand, vvdChoice, vvdAccepted, 
-                                 vvdRejected, vvdCfg >>
+                                 vvdVid, vvdRand, vvdChoice, vvdPendingBdoc, 
+                                 vvdPendingChoices, vvdAccepted, vvdRejected, 
+                                 vvdCfg >>
 
 ProviderProc == Provider_RecvAuthStart \/ Provider_RecvAuthSignature
                    \/ Provider_RecvAuthStatusReq \/ Provider_RecvGetCertReq
@@ -2800,13 +2964,13 @@ Sign_RecvAuthChallenge == /\ pc[SignPid] = "Sign_RecvAuthChallenge"
                                           chSignToProvider, chVoterToSign, 
                                           chCSToReg, chRegToCS, chVCDToVVD, 
                                           chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                          voterScenarioIdx, voterPhase, 
-                                          voterChoice, accepted, voterAccept, 
-                                          verifiedBDOCs, vcdScenarioIdx, 
-                                          vcdCtx, vcdChoice, vcdVoteBDOC, 
-                                          vcdVoteReq, vcdVoteRes, vcdCfg, 
-                                          csScenarioIdx, csSessionStore, 
-                                          csBallotStore, csLatest, 
+                                          chVoterToVVD, voterScenarioIdx, 
+                                          voterPhase, voterChoice, accepted, 
+                                          voterAccept, verifiedBDOCs, 
+                                          vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                          vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                          vcdCfg, csScenarioIdx, 
+                                          csSessionStore, csBallotStore, 
                                           csDroppedBallot, csReqCnt, 
                                           csFreshnessStore, csCfg, 
                                           providerScenarioIdx, 
@@ -2818,6 +2982,7 @@ Sign_RecvAuthChallenge == /\ pc[SignPid] = "Sign_RecvAuthChallenge"
                                           regOcspStore, regNextOCSPIdx, 
                                           regDroppedLogEntry, vvdScenarioIdx, 
                                           vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                          vvdPendingBdoc, vvdPendingChoices, 
                                           vvdAccepted, vvdRejected, vvdCfg >>
 
 Sign_RecvAuthApproval == /\ pc[SignPid] = "Sign_RecvAuthApproval"
@@ -2833,14 +2998,14 @@ Sign_RecvAuthApproval == /\ pc[SignPid] = "Sign_RecvAuthApproval"
                                          chProviderToSign, chSignToVoter, 
                                          chCSToReg, chRegToCS, chVCDToVVD, 
                                          chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                         voterScenarioIdx, voterPhase, 
-                                         voterChoice, accepted, voterAccept, 
-                                         verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                         vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                         vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                         csSessionStore, csBallotStore, 
-                                         csLatest, csDroppedBallot, csReqCnt, 
-                                         csFreshnessStore, csCfg, 
+                                         chVoterToVVD, voterScenarioIdx, 
+                                         voterPhase, voterChoice, accepted, 
+                                         voterAccept, verifiedBDOCs, 
+                                         vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                         vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                         vcdCfg, csScenarioIdx, csSessionStore, 
+                                         csBallotStore, csDroppedBallot, 
+                                         csReqCnt, csFreshnessStore, csCfg, 
                                          providerScenarioIdx, 
                                          providerSessionStore, 
                                          providerCertStore, provAuthSid, 
@@ -2850,6 +3015,7 @@ Sign_RecvAuthApproval == /\ pc[SignPid] = "Sign_RecvAuthApproval"
                                          regOcspStore, regNextOCSPIdx, 
                                          regDroppedLogEntry, vvdScenarioIdx, 
                                          vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                         vvdPendingBdoc, vvdPendingChoices, 
                                          vvdAccepted, vvdRejected, vvdCfg >>
 
 Sign_RecvSignChallenge == /\ pc[SignPid] = "Sign_RecvSignChallenge"
@@ -2865,13 +3031,13 @@ Sign_RecvSignChallenge == /\ pc[SignPid] = "Sign_RecvSignChallenge"
                                           chSignToProvider, chVoterToSign, 
                                           chCSToReg, chRegToCS, chVCDToVVD, 
                                           chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                          voterScenarioIdx, voterPhase, 
-                                          voterChoice, accepted, voterAccept, 
-                                          verifiedBDOCs, vcdScenarioIdx, 
-                                          vcdCtx, vcdChoice, vcdVoteBDOC, 
-                                          vcdVoteReq, vcdVoteRes, vcdCfg, 
-                                          csScenarioIdx, csSessionStore, 
-                                          csBallotStore, csLatest, 
+                                          chVoterToVVD, voterScenarioIdx, 
+                                          voterPhase, voterChoice, accepted, 
+                                          voterAccept, verifiedBDOCs, 
+                                          vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                          vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                          vcdCfg, csScenarioIdx, 
+                                          csSessionStore, csBallotStore, 
                                           csDroppedBallot, csReqCnt, 
                                           csFreshnessStore, csCfg, 
                                           providerScenarioIdx, 
@@ -2883,6 +3049,7 @@ Sign_RecvSignChallenge == /\ pc[SignPid] = "Sign_RecvSignChallenge"
                                           regOcspStore, regNextOCSPIdx, 
                                           regDroppedLogEntry, vvdScenarioIdx, 
                                           vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                          vvdPendingBdoc, vvdPendingChoices, 
                                           vvdAccepted, vvdRejected, vvdCfg >>
 
 Sign_RecvSignApproval == /\ pc[SignPid] = "Sign_RecvSignApproval"
@@ -2898,14 +3065,14 @@ Sign_RecvSignApproval == /\ pc[SignPid] = "Sign_RecvSignApproval"
                                          chProviderToSign, chSignToVoter, 
                                          chCSToReg, chRegToCS, chVCDToVVD, 
                                          chVVDToCS, chCSToVVD, chVVDToVoter, 
-                                         voterScenarioIdx, voterPhase, 
-                                         voterChoice, accepted, voterAccept, 
-                                         verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                         vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                         vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                         csSessionStore, csBallotStore, 
-                                         csLatest, csDroppedBallot, csReqCnt, 
-                                         csFreshnessStore, csCfg, 
+                                         chVoterToVVD, voterScenarioIdx, 
+                                         voterPhase, voterChoice, accepted, 
+                                         voterAccept, verifiedBDOCs, 
+                                         vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                         vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                         vcdCfg, csScenarioIdx, csSessionStore, 
+                                         csBallotStore, csDroppedBallot, 
+                                         csReqCnt, csFreshnessStore, csCfg, 
                                          providerScenarioIdx, 
                                          providerSessionStore, 
                                          providerCertStore, provAuthSid, 
@@ -2915,6 +3082,7 @@ Sign_RecvSignApproval == /\ pc[SignPid] = "Sign_RecvSignApproval"
                                          regOcspStore, regNextOCSPIdx, 
                                          regDroppedLogEntry, vvdScenarioIdx, 
                                          vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                         vvdPendingBdoc, vvdPendingChoices, 
                                          vvdAccepted, vvdRejected, vvdCfg >>
 
 Sign_Done == /\ pc[SignPid] = "Sign_Done"
@@ -2935,19 +3103,20 @@ Sign_Done == /\ pc[SignPid] = "Sign_Done"
                              chProviderToCS, chProviderToSign, 
                              chSignToProvider, chSignToVoter, chVoterToSign, 
                              chCSToReg, chRegToCS, chVCDToVVD, chVVDToCS, 
-                             chCSToVVD, chVVDToVoter, voterScenarioIdx, 
-                             voterPhase, voterChoice, accepted, voterAccept, 
-                             verifiedBDOCs, vcdScenarioIdx, vcdCtx, vcdChoice, 
-                             vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
-                             csScenarioIdx, csSessionStore, csBallotStore, 
-                             csLatest, csDroppedBallot, csReqCnt, 
-                             csFreshnessStore, csCfg, providerScenarioIdx, 
-                             providerSessionStore, providerCertStore, 
-                             provAuthSid, provSignSid, regScenarioIdx, 
-                             regStore, regNextIdx, regOcspStore, 
-                             regNextOCSPIdx, regDroppedLogEntry, 
+                             chCSToVVD, chVVDToVoter, chVoterToVVD, 
+                             voterScenarioIdx, voterPhase, voterChoice, 
+                             accepted, voterAccept, verifiedBDOCs, 
+                             vcdScenarioIdx, vcdCtx, vcdChoice, vcdVoteBDOC, 
+                             vcdVoteReq, vcdVoteRes, vcdCfg, csScenarioIdx, 
+                             csSessionStore, csBallotStore, csDroppedBallot, 
+                             csReqCnt, csFreshnessStore, csCfg, 
+                             providerScenarioIdx, providerSessionStore, 
+                             providerCertStore, provAuthSid, provSignSid, 
+                             regScenarioIdx, regStore, regNextIdx, 
+                             regOcspStore, regNextOCSPIdx, regDroppedLogEntry, 
                              vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                             vvdChoice, vvdAccepted, vvdRejected, vvdCfg >>
+                             vvdChoice, vvdPendingBdoc, vvdPendingChoices, 
+                             vvdAccepted, vvdRejected, vvdCfg >>
 
 SignProc == Sign_RecvAuthChallenge \/ Sign_RecvAuthApproval
                \/ Sign_RecvSignChallenge \/ Sign_RecvSignApproval
@@ -2968,12 +3137,12 @@ Reg_RecvTSPReq == /\ pc[RegPid] = "Reg_RecvTSPReq"
                                   chProviderToCS, chProviderToSign, 
                                   chSignToProvider, chSignToVoter, 
                                   chVoterToSign, chVCDToVVD, chVVDToCS, 
-                                  chCSToVVD, chVVDToVoter, voterScenarioIdx, 
-                                  voterPhase, voterChoice, accepted, 
-                                  voterAccept, verifiedBDOCs, vcdScenarioIdx, 
-                                  vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                  vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                  csSessionStore, csBallotStore, csLatest, 
+                                  chCSToVVD, chVVDToVoter, chVoterToVVD, 
+                                  voterScenarioIdx, voterPhase, voterChoice, 
+                                  accepted, voterAccept, verifiedBDOCs, 
+                                  vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                  vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
+                                  csScenarioIdx, csSessionStore, csBallotStore, 
                                   csDroppedBallot, csReqCnt, csFreshnessStore, 
                                   csCfg, providerScenarioIdx, 
                                   providerSessionStore, providerCertStore, 
@@ -2982,7 +3151,8 @@ Reg_RecvTSPReq == /\ pc[RegPid] = "Reg_RecvTSPReq"
                                   signPhone, regScenarioIdx, regOcspStore, 
                                   regNextOCSPIdx, regDroppedLogEntry, 
                                   vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                                  vvdChoice, vvdAccepted, vvdRejected, vvdCfg >>
+                                  vvdChoice, vvdPendingBdoc, vvdPendingChoices, 
+                                  vvdAccepted, vvdRejected, vvdCfg >>
 
 Reg_RecvOCSPReq == /\ pc[RegPid] = "Reg_RecvOCSPReq"
                    /\ chCSToReg.tag = "OCSPReq"
@@ -2999,21 +3169,23 @@ Reg_RecvOCSPReq == /\ pc[RegPid] = "Reg_RecvOCSPReq"
                                    chProviderToCS, chProviderToSign, 
                                    chSignToProvider, chSignToVoter, 
                                    chVoterToSign, chVCDToVVD, chVVDToCS, 
-                                   chCSToVVD, chVVDToVoter, voterScenarioIdx, 
-                                   voterPhase, voterChoice, accepted, 
-                                   voterAccept, verifiedBDOCs, vcdScenarioIdx, 
-                                   vcdCtx, vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                   vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                   csSessionStore, csBallotStore, csLatest, 
-                                   csDroppedBallot, csReqCnt, csFreshnessStore, 
-                                   csCfg, providerScenarioIdx, 
-                                   providerSessionStore, providerCertStore, 
-                                   provAuthSid, provSignSid, signScenarioIdx, 
-                                   signAuthChallenge, authPhone, signChallenge, 
-                                   signPhone, regScenarioIdx, regStore, 
-                                   regNextIdx, regDroppedLogEntry, 
-                                   vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                                   vvdChoice, vvdAccepted, vvdRejected, vvdCfg >>
+                                   chCSToVVD, chVVDToVoter, chVoterToVVD, 
+                                   voterScenarioIdx, voterPhase, voterChoice, 
+                                   accepted, voterAccept, verifiedBDOCs, 
+                                   vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                   vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
+                                   csScenarioIdx, csSessionStore, 
+                                   csBallotStore, csDroppedBallot, csReqCnt, 
+                                   csFreshnessStore, csCfg, 
+                                   providerScenarioIdx, providerSessionStore, 
+                                   providerCertStore, provAuthSid, provSignSid, 
+                                   signScenarioIdx, signAuthChallenge, 
+                                   authPhone, signChallenge, signPhone, 
+                                   regScenarioIdx, regStore, regNextIdx, 
+                                   regDroppedLogEntry, vvdScenarioIdx, 
+                                   vvdSidCS, vvdVid, vvdRand, vvdChoice, 
+                                   vvdPendingBdoc, vvdPendingChoices, 
+                                   vvdAccepted, vvdRejected, vvdCfg >>
 
 Reg_DropLogEntry == /\ pc[RegPid] = "Reg_DropLogEntry"
                     /\ IF AllowVotingFaultInjection
@@ -3035,13 +3207,13 @@ Reg_DropLogEntry == /\ pc[RegPid] = "Reg_DropLogEntry"
                                     chSignToProvider, chSignToVoter, 
                                     chVoterToSign, chCSToReg, chRegToCS, 
                                     chVCDToVVD, chVVDToCS, chCSToVVD, 
-                                    chVVDToVoter, voterScenarioIdx, voterPhase, 
-                                    voterChoice, accepted, voterAccept, 
-                                    verifiedBDOCs, vcdScenarioIdx, vcdCtx, 
-                                    vcdChoice, vcdVoteBDOC, vcdVoteReq, 
-                                    vcdVoteRes, vcdCfg, csScenarioIdx, 
-                                    csSessionStore, csBallotStore, csLatest, 
-                                    csDroppedBallot, csReqCnt, 
+                                    chVVDToVoter, chVoterToVVD, 
+                                    voterScenarioIdx, voterPhase, voterChoice, 
+                                    accepted, voterAccept, verifiedBDOCs, 
+                                    vcdScenarioIdx, vcdCtx, vcdChoice, 
+                                    vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
+                                    vcdCfg, csScenarioIdx, csSessionStore, 
+                                    csBallotStore, csDroppedBallot, csReqCnt, 
                                     csFreshnessStore, csCfg, 
                                     providerScenarioIdx, providerSessionStore, 
                                     providerCertStore, provAuthSid, 
@@ -3050,8 +3222,9 @@ Reg_DropLogEntry == /\ pc[RegPid] = "Reg_DropLogEntry"
                                     signChallenge, signPhone, regScenarioIdx, 
                                     regNextIdx, regOcspStore, regNextOCSPIdx, 
                                     vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                                    vvdChoice, vvdAccepted, vvdRejected, 
-                                    vvdCfg >>
+                                    vvdChoice, vvdPendingBdoc, 
+                                    vvdPendingChoices, vvdAccepted, 
+                                    vvdRejected, vvdCfg >>
 
 Reg_Done == /\ pc[RegPid] = "Reg_Done"
             /\ IF regScenarioIdx < Len(VotingScenario)
@@ -3065,20 +3238,21 @@ Reg_Done == /\ pc[RegPid] = "Reg_Done"
                             chCSToVCD, chCSToProvider, chProviderToCS, 
                             chProviderToSign, chSignToProvider, chSignToVoter, 
                             chVoterToSign, chCSToReg, chRegToCS, chVCDToVVD, 
-                            chVVDToCS, chCSToVVD, chVVDToVoter, 
+                            chVVDToCS, chCSToVVD, chVVDToVoter, chVoterToVVD, 
                             voterScenarioIdx, voterPhase, voterChoice, 
                             accepted, voterAccept, verifiedBDOCs, 
                             vcdScenarioIdx, vcdCtx, vcdChoice, vcdVoteBDOC, 
                             vcdVoteReq, vcdVoteRes, vcdCfg, csScenarioIdx, 
-                            csSessionStore, csBallotStore, csLatest, 
-                            csDroppedBallot, csReqCnt, csFreshnessStore, csCfg, 
+                            csSessionStore, csBallotStore, csDroppedBallot, 
+                            csReqCnt, csFreshnessStore, csCfg, 
                             providerScenarioIdx, providerSessionStore, 
                             providerCertStore, provAuthSid, provSignSid, 
                             signScenarioIdx, signAuthChallenge, authPhone, 
                             signChallenge, signPhone, regStore, regNextIdx, 
                             regOcspStore, regNextOCSPIdx, regDroppedLogEntry, 
                             vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                            vvdChoice, vvdAccepted, vvdRejected, vvdCfg >>
+                            vvdChoice, vvdPendingBdoc, vvdPendingChoices, 
+                            vvdAccepted, vvdRejected, vvdCfg >>
 
 RegProc == Reg_RecvTSPReq \/ Reg_RecvOCSPReq \/ Reg_DropLogEntry
               \/ Reg_Done
@@ -3096,11 +3270,11 @@ VVD_RecvQR == /\ pc[VVDPid] = "VVD_RecvQR"
                               chProviderToCS, chProviderToSign, 
                               chSignToProvider, chSignToVoter, chVoterToSign, 
                               chCSToReg, chRegToCS, chCSToVVD, chVVDToVoter, 
-                              voterScenarioIdx, voterPhase, voterChoice, 
-                              accepted, voterAccept, verifiedBDOCs, 
-                              vcdScenarioIdx, vcdCtx, vcdChoice, vcdVoteBDOC, 
-                              vcdVoteReq, vcdVoteRes, vcdCfg, csScenarioIdx, 
-                              csSessionStore, csBallotStore, csLatest, 
+                              chVoterToVVD, voterScenarioIdx, voterPhase, 
+                              voterChoice, accepted, voterAccept, 
+                              verifiedBDOCs, vcdScenarioIdx, vcdCtx, vcdChoice, 
+                              vcdVoteBDOC, vcdVoteReq, vcdVoteRes, vcdCfg, 
+                              csScenarioIdx, csSessionStore, csBallotStore, 
                               csDroppedBallot, csReqCnt, csFreshnessStore, 
                               csCfg, providerScenarioIdx, providerSessionStore, 
                               providerCertStore, provAuthSid, provSignSid, 
@@ -3108,35 +3282,37 @@ VVD_RecvQR == /\ pc[VVDPid] = "VVD_RecvQR"
                               signChallenge, signPhone, regScenarioIdx, 
                               regStore, regNextIdx, regOcspStore, 
                               regNextOCSPIdx, regDroppedLogEntry, 
-                              vvdScenarioIdx, vvdChoice, vvdAccepted, 
-                              vvdRejected, vvdCfg >>
+                              vvdScenarioIdx, vvdChoice, vvdPendingBdoc, 
+                              vvdPendingChoices, vvdAccepted, vvdRejected, 
+                              vvdCfg >>
 
 VVD_RecvVerifyRes == /\ pc[VVDPid] = "VVD_RecvVerifyRes"
                      /\ chCSToVVD.tag = "VerifyRes"
                      /\ LET p == chCSToVVD.body.payload IN
-                          /\ IF /\ ValidateBallot(vvdCfg, p.bdoc, p.tsp, p.ocsp, p.choices) /\ RecoverChoiceByRand(vvdCfg, vvdRand, p.bdoc.ct, p.choices) # NoStr
-                                THEN /\ vvdChoice' = RecoverChoiceByRand(vvdCfg, vvdRand, p.bdoc.ct, p.choices)
-                                     /\ vvdAccepted' = TRUE
-                                     /\ chVVDToVoter' = VVDToVoter("VerifyDisplay", [choice |-> vvdChoice', bdoc |-> p.bdoc])
+                          /\ IF ValidateBallot(vvdCfg, p.bdoc, p.tsp, p.ocsp, p.choices)
+                                THEN /\ vvdPendingBdoc' = p.bdoc
+                                     /\ vvdPendingChoices' = p.choices
+                                     /\ chVVDToVoter' = VVDToVoter("VerifyPreDecryptDisplay", [bdoc |-> p.bdoc, ct |-> p.bdoc.ct, pnoee |-> p.bdoc.signerCert.pnoee])
                                      /\ UNCHANGED vvdRejected
                                 ELSE /\ vvdRejected' = TRUE
                                      /\ chVVDToVoter' = VVDToVoter("VerifyFailed", NoBody)
-                                     /\ UNCHANGED << vvdChoice, vvdAccepted >>
+                                     /\ UNCHANGED << vvdPendingBdoc, 
+                                                     vvdPendingChoices >>
                           /\ chCSToVVD' = NoMsg
-                     /\ pc' = [pc EXCEPT ![VVDPid] = "VVD_Done"]
+                     /\ pc' = [pc EXCEPT ![VVDPid] = "VVD_RecvDecryptApproval"]
                      /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, 
                                      chVCDToCS, chCSToVCD, chCSToProvider, 
                                      chProviderToCS, chProviderToSign, 
                                      chSignToProvider, chSignToVoter, 
                                      chVoterToSign, chCSToReg, chRegToCS, 
-                                     chVCDToVVD, chVVDToCS, voterScenarioIdx, 
-                                     voterPhase, voterChoice, accepted, 
-                                     voterAccept, verifiedBDOCs, 
+                                     chVCDToVVD, chVVDToCS, chVoterToVVD, 
+                                     voterScenarioIdx, voterPhase, voterChoice, 
+                                     accepted, voterAccept, verifiedBDOCs, 
                                      vcdScenarioIdx, vcdCtx, vcdChoice, 
                                      vcdVoteBDOC, vcdVoteReq, vcdVoteRes, 
                                      vcdCfg, csScenarioIdx, csSessionStore, 
-                                     csBallotStore, csLatest, csDroppedBallot, 
-                                     csReqCnt, csFreshnessStore, csCfg, 
+                                     csBallotStore, csDroppedBallot, csReqCnt, 
+                                     csFreshnessStore, csCfg, 
                                      providerScenarioIdx, providerSessionStore, 
                                      providerCertStore, provAuthSid, 
                                      provSignSid, signScenarioIdx, 
@@ -3145,7 +3321,52 @@ VVD_RecvVerifyRes == /\ pc[VVDPid] = "VVD_RecvVerifyRes"
                                      regStore, regNextIdx, regOcspStore, 
                                      regNextOCSPIdx, regDroppedLogEntry, 
                                      vvdScenarioIdx, vvdSidCS, vvdVid, vvdRand, 
-                                     vvdCfg >>
+                                     vvdChoice, vvdAccepted, vvdCfg >>
+
+VVD_RecvDecryptApproval == /\ pc[VVDPid] = "VVD_RecvDecryptApproval"
+                           /\ chVoterToVVD.tag = "ApproveDecrypt" \/ chVoterToVVD.tag = "RejectDecrypt"
+                           /\ IF chVoterToVVD.tag = "ApproveDecrypt"
+                                 THEN /\ IF RecoverChoiceByRand(vvdCfg, vvdRand, vvdPendingBdoc.ct, vvdPendingChoices) # NoStr
+                                            THEN /\ vvdChoice' = RecoverChoiceByRand(vvdCfg, vvdRand, vvdPendingBdoc.ct, vvdPendingChoices)
+                                                 /\ vvdAccepted' = TRUE
+                                                 /\ chVVDToVoter' = VVDToVoter("VerifyDisplay", [choice |-> vvdChoice', bdoc |-> vvdPendingBdoc])
+                                                 /\ UNCHANGED vvdRejected
+                                            ELSE /\ vvdRejected' = TRUE
+                                                 /\ chVVDToVoter' = VVDToVoter("VerifyFailed", NoBody)
+                                                 /\ UNCHANGED << vvdChoice, 
+                                                                 vvdAccepted >>
+                                 ELSE /\ TRUE
+                                      /\ UNCHANGED << chVVDToVoter, vvdChoice, 
+                                                      vvdAccepted, vvdRejected >>
+                           /\ chVoterToVVD' = NoMsg
+                           /\ pc' = [pc EXCEPT ![VVDPid] = "VVD_Done"]
+                           /\ UNCHANGED << scenarioIdx, chVoterToVCD, 
+                                           chVCDToVoter, chVCDToCS, chCSToVCD, 
+                                           chCSToProvider, chProviderToCS, 
+                                           chProviderToSign, chSignToProvider, 
+                                           chSignToVoter, chVoterToSign, 
+                                           chCSToReg, chRegToCS, chVCDToVVD, 
+                                           chVVDToCS, chCSToVVD, 
+                                           voterScenarioIdx, voterPhase, 
+                                           voterChoice, accepted, voterAccept, 
+                                           verifiedBDOCs, vcdScenarioIdx, 
+                                           vcdCtx, vcdChoice, vcdVoteBDOC, 
+                                           vcdVoteReq, vcdVoteRes, vcdCfg, 
+                                           csScenarioIdx, csSessionStore, 
+                                           csBallotStore, csDroppedBallot, 
+                                           csReqCnt, csFreshnessStore, csCfg, 
+                                           providerScenarioIdx, 
+                                           providerSessionStore, 
+                                           providerCertStore, provAuthSid, 
+                                           provSignSid, signScenarioIdx, 
+                                           signAuthChallenge, authPhone, 
+                                           signChallenge, signPhone, 
+                                           regScenarioIdx, regStore, 
+                                           regNextIdx, regOcspStore, 
+                                           regNextOCSPIdx, regDroppedLogEntry, 
+                                           vvdScenarioIdx, vvdSidCS, vvdVid, 
+                                           vvdRand, vvdPendingBdoc, 
+                                           vvdPendingChoices, vvdCfg >>
 
 VVD_Done == /\ pc[VVDPid] = "VVD_Done"
             /\ IF vvdScenarioIdx < Len(VotingScenario)
@@ -3155,25 +3376,28 @@ VVD_Done == /\ pc[VVDPid] = "VVD_Done"
                        /\ vvdVid' = NoInt
                        /\ vvdRand' = Empty
                        /\ vvdChoice' = NoStr
+                       /\ vvdPendingBdoc' = EmptyBDOC
+                       /\ vvdPendingChoices' = {}
                        /\ vvdAccepted' = FALSE
                        /\ vvdRejected' = FALSE
                        /\ pc' = [pc EXCEPT ![VVDPid] = "VVD_RecvQR"]
                   ELSE /\ TRUE
                        /\ pc' = [pc EXCEPT ![VVDPid] = "Done"]
                        /\ UNCHANGED << vvdScenarioIdx, vvdSidCS, vvdVid, 
-                                       vvdRand, vvdChoice, vvdAccepted, 
+                                       vvdRand, vvdChoice, vvdPendingBdoc, 
+                                       vvdPendingChoices, vvdAccepted, 
                                        vvdRejected >>
             /\ UNCHANGED << scenarioIdx, chVoterToVCD, chVCDToVoter, chVCDToCS, 
                             chCSToVCD, chCSToProvider, chProviderToCS, 
                             chProviderToSign, chSignToProvider, chSignToVoter, 
                             chVoterToSign, chCSToReg, chRegToCS, chVCDToVVD, 
-                            chVVDToCS, chCSToVVD, chVVDToVoter, 
+                            chVVDToCS, chCSToVVD, chVVDToVoter, chVoterToVVD, 
                             voterScenarioIdx, voterPhase, voterChoice, 
                             accepted, voterAccept, verifiedBDOCs, 
                             vcdScenarioIdx, vcdCtx, vcdChoice, vcdVoteBDOC, 
                             vcdVoteReq, vcdVoteRes, vcdCfg, csScenarioIdx, 
-                            csSessionStore, csBallotStore, csLatest, 
-                            csDroppedBallot, csReqCnt, csFreshnessStore, csCfg, 
+                            csSessionStore, csBallotStore, csDroppedBallot, 
+                            csReqCnt, csFreshnessStore, csCfg, 
                             providerScenarioIdx, providerSessionStore, 
                             providerCertStore, provAuthSid, provSignSid, 
                             signScenarioIdx, signAuthChallenge, authPhone, 
@@ -3181,7 +3405,8 @@ VVD_Done == /\ pc[VVDPid] = "VVD_Done"
                             regNextIdx, regOcspStore, regNextOCSPIdx, 
                             regDroppedLogEntry, vvdCfg >>
 
-VVDProc == VVD_RecvQR \/ VVD_RecvVerifyRes \/ VVD_Done
+VVDProc == VVD_RecvQR \/ VVD_RecvVerifyRes \/ VVD_RecvDecryptApproval
+              \/ VVD_Done
 
 (* Allow infinite stuttering to prevent deadlock on termination. *)
 Terminating == /\ \A self \in ProcSet: pc[self] = "Done"
@@ -3207,8 +3432,13 @@ Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 VotingComplete == /\ scenarioIdx = Len(VotingScenario) /\ \A self \in ProcSet: pc[self] = "Done"
 CSExportOfStore(store) == [vid \in DOMAIN store |-> [store[vid] EXCEPT !.verCount = 0]]
 
-\* vvd accepts the latest ballot while CS still retains the latest-vote record
-Inv_VVDAcceptsLatestVote == (vvdAccepted /\ vvdScenarioIdx = scenarioIdx /\ ~csDroppedBallot) => vvdVid = csLatest.vid
+\* vvd accepts the latest registered ballot retained by CS
+Inv_VVDAcceptsLatestVote ==
+  (vvdAccepted /\ vvdScenarioIdx = scenarioIdx /\ ~csDroppedBallot) =>
+    LET ballot == StoreLookup(csBallotStore, vvdVid) IN
+    IF ballot # Empty
+    THEN vvdVid = LatestRegisteredBallot(csBallotStore, ballot.voterId).vid
+    ELSE FALSE
 
 \* if CS and Reg did not both delete local evidence, an individually verified ballot
 \* still has a local record in either CS or Reg

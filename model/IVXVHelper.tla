@@ -29,8 +29,19 @@ OpenAuthToken(k, tok) == AEADDec(k, tok)
 VerifyTrustedX509Cert(rootCACert, cert) ==
   VerifyX509Cert(cert) /\ cert.issuerCert = rootCACert
 
-VoteVidsForVoter(ballotStore, voterId) ==
+RegisteredBallotVidsForVoter(ballotStore, voterId) ==
   {v \in DOMAIN ballotStore: ballotStore[v].voterId = voterId}
+
+LatestRegisteredBallot(ballotStore, voterId) ==
+  IF RegisteredBallotVidsForVoter(ballotStore, voterId) # {}
+  THEN LET latestVid ==
+             CHOOSE v \in RegisteredBallotVidsForVoter(ballotStore, voterId) :
+               \A other \in RegisteredBallotVidsForVoter(ballotStore, voterId) :
+                 \/ ballotStore[v].registered > ballotStore[other].registered
+                 \/ /\ ballotStore[v].registered = ballotStore[other].registered
+                    /\ v >= other
+       IN ballotStore[latestVid]
+  ELSE EmptyRegisteredBallot
 
 ProviderSidsForPhone(store, phone, kind) ==
   {sid \in DOMAIN store: /\ store[sid].phone = phone /\ store[sid].kind = kind}

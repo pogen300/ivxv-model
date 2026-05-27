@@ -21,16 +21,20 @@ NoVoterRef == VoterRef(NoStr, NoStr)
 BDOC(ct, signerCert, sig, tbs) == [ ct |-> ct, signerCert |-> signerCert, sig |-> sig, tbs |-> tbs ]
 EmptyBDOC == BDOC(Empty, Empty, Empty, Empty)
 
-SessionCtx(authChallenge, authTokNonce, issuedVid, signDigest, voteVid, tspReq, ocspReq, clientId) ==
+SessionCtx(authChallenge, authTokNonce, issuedVid, signDigest, voteVid, submitted, bdoc, tspReq, ocspReq, tspRes, ocspRes, clientId) ==
   [ authChallenge |-> authChallenge,
     authTokNonce  |-> authTokNonce,
     issuedVid     |-> issuedVid,
     signDigest    |-> signDigest,
     voteVid       |-> voteVid,
+    submitted     |-> submitted,
+    bdoc          |-> bdoc,
     tspReq        |-> tspReq,
     ocspReq       |-> ocspReq,
+    tspRes        |-> tspRes,
+    ocspRes       |-> ocspRes,
     clientId      |-> clientId ]
-EmptySessionCtx == SessionCtx(Empty, Empty, NoInt, Empty, NoInt, NoTSPReq, NoOCSPReq, NoInt)
+EmptySessionCtx == SessionCtx(Empty, Empty, NoInt, Empty, NoInt, NoInt, EmptyBDOC, NoTSPReq, NoOCSPReq, NoTSPRes, NoOCSPRes, NoInt)
 
 SessionData(sid, phase, voterId, phone, tok, exp, ctx) ==
   [ sid     |-> sid,
@@ -46,19 +50,18 @@ EmptySession(voterId, phone) == SessionData(NoInt, NoStr, voterId, phone, Empty,
 \* SessionStore: id -> SessionData
 EmptySessionStore == [sid \in {} |-> NoSession]
 
-StoredVote(vid, voterId, submitted, bdoc, tsp, ocsp, verCount) ==
+RegisteredBallot(vid, voterId, submitted, registered, bdoc, tsp, ocsp, verCount, isTestVote) ==
   [ vid       |-> vid,
     voterId   |-> voterId,
     submitted |-> submitted,
+    registered |-> registered,
     bdoc      |-> bdoc,
     tsp       |-> tsp,
     ocsp      |-> ocsp,
-    verCount  |-> verCount ]
-EmptyStoredVote == StoredVote(NoInt, NoStr, NoInt, EmptyBDOC, NoTSPRes, NoOCSPRes, 0)
-EmptyCSBallotStore == [vid \in {} |-> EmptyStoredVote]
-
-LatestVote(vid, t) == [ vid |-> vid, t |-> t ]
-EmptyLatestVote == [ vid |-> NoInt, t |-> NoInt ]
+    verCount  |-> verCount,
+    isTestVote |-> isTestVote ]
+EmptyRegisteredBallot == RegisteredBallot(NoInt, NoStr, NoInt, NoInt, EmptyBDOC, NoTSPRes, NoOCSPRes, 0, FALSE)
+EmptyCSBallotStore == [vid \in {} |-> EmptyRegisteredBallot]
 
 EGParams == "EG"
 RSAParams == "RSA"
@@ -119,9 +122,11 @@ EmptyVoterBallot == VoterBallot(NoStr, {}, FALSE)
 BallotResponse(ballot, req, resp) == [ ballot |-> ballot, req |-> req, resp |-> resp ]
 EmptyBallotResponse == BallotResponse(EmptyBallot, NoTSPReq, NoTSPRes)
 
-PALogEntry(t, h, voterId, ballotId) == [ t |-> t, h |-> h, voterId  |-> voterId, ballotId |-> ballotId ]
+PALogEntry(t, h, voterId) == [ t |-> t, h |-> h, voterId |-> voterId ]
 
-PAErrorLogEntry(ref, err) == [ ref |-> ref, err |-> err ]
+PAErrorLogEntry(voterId, ballotId, err) == [ voterId |-> voterId, ballotId |-> ballotId, err |-> err ]
+
+RawBallotEntry(ballotId, voterId, c) == [ ballotId |-> ballotId, voterId |-> voterId, c |-> c ]
 
 DecryptedVote(d, p, q, ct, dp) == [ d |-> d, p |-> p, q |-> q, ct |-> ct, dp |-> dp ]
 

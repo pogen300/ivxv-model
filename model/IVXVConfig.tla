@@ -144,7 +144,7 @@ ScenarioVid(i) == CSFreshnessStore[i].issuedVid
 ScenarioIdForVid(vid) == CHOOSE i \in ScenarioIds : ScenarioVid(i) = vid
 
 \* Voting-phase expected output derived from VotingScenario
-BuildScenarioStoredVote(i) ==
+BuildScenarioRegisteredBallot(i) ==
   LET voterProfile == ScenarioVoterProfile(i)
       voterId == voterProfile.voterId
       phone == voterProfile.phone
@@ -155,10 +155,10 @@ BuildScenarioStoredVote(i) ==
       tsp == TSPRes(req.m, req.n, PhaseTSPTime, ExpectedPublicConfig.tspRegCert, Sign(TSPRegSK, << req.m, req.n, PhaseTSPTime >>))
       ocspReq == OCSPReq(bdoc.signerCert)
       ocsp == OCSPRes(ocspReq, TRUE, PhaseOCSPTime, ExpectedPublicConfig.ocspCert, Sign(OCSPSK, << ocspReq, TRUE, PhaseOCSPTime >>))
-  IN  StoredVote(ScenarioVid(i), voterId, PhaseVoteSubmittedTime, bdoc, tsp, ocsp, 0)
+  IN  RegisteredBallot(ScenarioVid(i), voterId, PhaseVoteSubmittedTime, tsp.t, bdoc, tsp, ocsp, 0, FALSE)
 
 ExpectedCSExportFromScenario ==
-  [vid \in { ScenarioVid(i) : i \in ScenarioIds } |-> BuildScenarioStoredVote(ScenarioIdForVid(vid))]
+  [vid \in { ScenarioVid(i) : i \in ScenarioIds } |-> BuildScenarioRegisteredBallot(ScenarioIdForVid(vid))]
 
 ExpectedRegExportFromScenario ==
   [i \in ScenarioIds |->

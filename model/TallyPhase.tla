@@ -13,6 +13,9 @@ AAPid == 7
 \* ======================
 \* CheckTool
 \* ======================
+CreatePALogEntry(t, c, voterId) == PALogEntry(t, Hash(c), voterId)
+CreatePAErrorLogEntry(voterId, ballotId, err) == PAErrorLogEntry(voterId, ballotId, err)
+
 \* Load CS Export 
 CreateBallotResponseErr(cfg, voterList, r) ==
   CASE ~(r.voterId \in DOMAIN voterList) -> VOTER_NOT_FOUND
@@ -43,10 +46,15 @@ LoadedBallotResponses(cfg, voterList, csExport) ==
 LoadBallotFileRecord(cfg, voterList, csExport) ==
   LET loaded == LoadedBallotResponses(cfg, voterList, csExport)
       keptIdxs == { j \in DOMAIN loaded : KeepEarliestBallotResp(j, loaded) }
-      localErr == { PAErrorLogEntry(vid, CreateBallotResponseErr(cfg, voterList, StoreLookup(csExport, vid))) :
+      localErr == { CreatePAErrorLogEntry(StoreLookup(csExport, vid).voterId,
+                                          vid,
+                                          CreateBallotResponseErr(cfg, voterList, StoreLookup(csExport, vid))) :
                       vid \in { v \in DOMAIN csExport :
                                   CreateBallotResponseErr(cfg, voterList, StoreLookup(csExport, v)) # OK } }
-      recurrentRespErr == { PAErrorLogEntry(i, REG_RESP_NOT_UNIQUE) : i \in { j \in DOMAIN loaded : ~KeepEarliestBallotResp(j, loaded) } }
+      recurrentRespErr == { CreatePAErrorLogEntry(StoreLookup(loaded, i).ballot.voter.voterId,
+                                                  StoreLookup(loaded, i).ballot.id,
+                                                  REG_RESP_NOT_UNIQUE) :
+                             i \in { j \in DOMAIN loaded : ~KeepEarliestBallotResp(j, loaded) } }
   IN [ good |-> [ i \in keptIdxs |-> StoreLookup(loaded, i) ],
        err  |-> localErr \cup recurrentRespErr ]
 
@@ -55,7 +63,7 @@ LoadRegData(regExport) ==
   [ good |-> [ i \in { j \in DOMAIN regExport :
                          Cardinality(RegIdxsForReq(StoreLookup(regExport, j).req, regExport)) = 1 }
                |-> StoreLookup(regExport, i) ],
-    err  |-> { PAErrorLogEntry(req, REG_REQ_NOT_UNIQUE) :
+    err  |-> { CreatePAErrorLogEntry(NoStr, NoInt, REG_REQ_NOT_UNIQUE) :
                  req \in { x \in RegReqs(regExport) :
                              Cardinality(RegIdxsForReq(x, regExport)) > 1 } } ]
 
@@ -77,14 +85,16 @@ CheckCSRegConsistency(cs, reg) ==
   LET goodIdxs == { i \in DOMAIN cs : CheckCSRegConsistencyErr(StoreLookup(cs, i), reg) = OK }
       badIdxs == { i \in DOMAIN cs : CheckCSRegConsistencyErr(StoreLookup(cs, i), reg) # OK }
   IN [ good |-> [ i \in goodIdxs |-> StoreLookup(cs, i) ],
-        err  |-> { PAErrorLogEntry(StoreLookup(cs, i).ballot.id, CheckCSRegConsistencyErr(StoreLookup(cs, i), reg)) :
+        err  |-> { CreatePAErrorLogEntry(StoreLookup(cs, i).ballot.voter.voterId,
+                                         StoreLookup(cs, i).ballot.id,
+                                         CheckCSRegConsistencyErr(StoreLookup(cs, i), reg)) :
                      i \in badIdxs } ]
 
 CheckRegCSConsistency(reg, cs) ==
   LET goodIdxs == { i \in DOMAIN reg : CheckRegCSConsistencyErr(StoreLookup(reg, i), cs) = OK }
       badIdxs == { i \in DOMAIN reg : CheckRegCSConsistencyErr(StoreLookup(reg, i), cs) # OK }
   IN [ good |-> [ i \in goodIdxs |-> StoreLookup(reg, i) ],
-        err  |-> { PAErrorLogEntry(StoreLookup(reg, i).req, CheckRegCSConsistencyErr(StoreLookup(reg, i), cs)) :
+        err  |-> { CreatePAErrorLogEntry(NoStr, NoInt, CheckRegCSConsistencyErr(StoreLookup(reg, i), cs)) :
                      i \in badIdxs } ]
 
 \* CheckTool Main body
@@ -110,7 +120,8 @@ CheckTool_GetlRegErrLog(cfg, voterList, csExport, regExport) ==
   IN regData.err \cup consistency.err
 
 CheckTool_GetAccLog(bbChecked) ==
-  UNION { { PALogEntry(b.t, BallotHash(b), vb.voterId, b.id) : b \in vb.ballots } :
+  UNION { UNION { { CreatePALogEntry(b.t, b.votes[q], vb.voterId) : q \in DOMAIN b.votes } :
+                  b \in vb.ballots } :
             vb \in bbChecked }
 
 \* ======================
@@ -125,15 +136,15 @@ KeptBallots(bbChecked, revokeList) ==
 FilterTool_BuildFilteredBB(bbChecked, revokeList) == KeptBallots(bbChecked, revokeList)
 
 FilterTool_FilterLog(bbChecked, revokeList) ==
-  { PALogEntry(b.t, BallotHash(b), b.voter.voterId, b.id) :
-      b \in UNION { vb.ballots : vb \in bbChecked } \ KeptBallots(bbChecked, revokeList) }
+  UNION { { CreatePALogEntry(b.t, b.votes[q], b.voter.voterId) : q \in DOMAIN b.votes } :
+            b \in UNION { vb.ballots : vb \in bbChecked } \ KeptBallots(bbChecked, revokeList) }
 
 \* ======================
 \* AnonTool
 \* ======================
 
 AnonTool_AnonymizeBB(cfg, bbFiltered) == { AnonVote(b.voter.d, b.voter.p, cfg.question, b.votes[cfg.question]) : b \in bbFiltered }
-AnonTool_AnonLog(bbFiltered) == { PALogEntry(0, Hash(a.ct), NoStr, NoStr) : a \in bbFiltered }
+AnonTool_AnonLog(bbFiltered) == { CreatePALogEntry(0, a.ct, NoStr) : a \in bbFiltered }
 
 \* ======================
 \* Tally
@@ -200,35 +211,26 @@ VerifyTally(cfg, er) == er.tally = BuildTallyFromPlain(cfg, er.plain)
 \* IntegrityTool
 LogHashSet(log) == { e.h : e \in log }
 LogHashSum(log) == Hash(LogHashSet(log))
-LogBallotIds(log) == { e.ballotId : e \in log }
-ErrorLogRefs(log) == { e.ref : e \in log }
+ErrorLogBallotIds(log) == { e.ballotId : e \in log }
 
-CSRecordBallotHash(cfg, r) == 
-	Hash(<< r.vid, r.tsp.t, [ q \in {cfg.question} |-> r.bdoc.ct] >>)
-
-CSRecordAnonHash(r) == Hash(r.bdoc.ct)
-
-CSExportHashSet(cfg, csExport) == 
-	{ CSRecordBallotHash(cfg, StoreLookup(csExport, vid)) : vid \in DOMAIN csExport }
-
-CSErrorHashSet(cfg, csExport, errLog) == 
-	{ CSRecordBallotHash(cfg, StoreLookup(csExport, vid)) : 
-		vid \in ErrorLogRefs(errLog) }
-
-CSAnonHashSetForIds(csExport, ids) ==
-  { CSRecordAnonHash(StoreLookup(csExport, vid)) : vid \in ids }
+RawEntryForCSRecord(r) == RawBallotEntry(r.vid, r.voterId, r.bdoc.ct)
+RawBallotEntries(csExport) == { RawEntryForCSRecord(StoreLookup(csExport, vid)) : vid \in DOMAIN csExport }
+RawEntryHashSet(raw) == { Hash(e.c) : e \in raw }
+AcceptedRawEntries(raw, accLog) ==
+  { r \in raw : \E e \in accLog : /\ e.h = Hash(r.c) /\ e.voterId = r.voterId }
+ErrorRawEntries(raw, errLog) ==
+  { r \in raw : r.ballotId \in ErrorLogBallotIds(errLog) }
 
 CSExportMatchesPALogs(cfg, csExport, accLog, errLog) ==
-  LET accIds == LogBallotIds(accLog)
-      errIds == ErrorLogRefs(errLog)
-  IN	/\ accIds \cap errIds = {} \* no ballot in both logAcc and logErr for checktool
-				\* alg:SumValidInvalid: check logAcc + logErr = csExport
-	     	/\ DOMAIN csExport = accIds \cup errIds \* ids match
-				/\ \A e \in accLog :
-						 /\ e.ballotId \in DOMAIN csExport
-						 /\ e.h = CSRecordBallotHash(cfg, StoreLookup(csExport, e.ballotId))
-	     	/\ Hash(CSExportHashSet(cfg, csExport)) = \* hash sums match
-	          Hash(LogHashSet(accLog) \cup CSErrorHashSet(cfg, csExport, errLog))
+  LET raw == RawBallotEntries(csExport)
+      accRaw == AcceptedRawEntries(raw, accLog)
+      errRaw == ErrorRawEntries(raw, errLog)
+  IN	/\ accRaw \cap errRaw = {}
+      /\ raw = accRaw \cup errRaw
+      /\ Cardinality(accLog) = Cardinality(accRaw)
+      /\ \A eAcc \in accLog :
+           \E rAcc \in raw : /\ eAcc.h = Hash(rAcc.c) /\ eAcc.voterId = rAcc.voterId
+      /\ \A eErr \in errLog : eErr.ballotId \in { rErr.ballotId : rErr \in raw }
 
 AnonCiphertexts(bbAnon) == { a.ct : a \in bbAnon }
 AnonBBHashSet(bbAnon) == { Hash(a.ct) : a \in bbAnon }
@@ -239,17 +241,13 @@ AnonLogMatchesBB(bbAnon, anonLog) ==
   /\ \A e \in anonLog :
        /\ e.t = 0
        /\ e.voterId = NoStr
-       /\ e.ballotId = NoStr
        /\ e.h \in AnonBBHashSet(bbAnon)
 
-AnonAndFilterLogsMatchAccLog(csExport, accLog, filterLog, anonLog) ==
-  LET accIds == LogBallotIds(accLog)
-      filterIds == LogBallotIds(filterLog)
-      anonIds == accIds \ filterIds
+AnonAndFilterLogsMatchAccLog(accLog, filterLog, anonLog) ==
+  LET keptLog == accLog \ filterLog
   IN /\ filterLog \subseteq accLog
-     /\ anonIds \subseteq DOMAIN csExport
-     /\ LogHashSet(anonLog) = CSAnonHashSetForIds(csExport, anonIds)
-     /\ Cardinality(anonLog) = Cardinality(anonIds)
+     /\ LogHashSet(anonLog) = LogHashSet(keptLog)
+     /\ Cardinality(anonLog) = Cardinality(keptLog)
 	                    	
 (*--algorithm TallyPhase {
   variables
@@ -1027,7 +1025,7 @@ Inv_AA_IntegrityTool ==
   AuditReady =>
     /\ CSExportMatchesPALogs(ExpectedPublicConfig, eaCSBallotStore, eaPAAccLog, eaPAErrLog)
     /\ AnonLogMatchesBB(eaAnonBB, eaPAAnonLog)
-    /\ AnonAndFilterLogsMatchAccLog(eaCSBallotStore, eaPAAccLog, eaPAFilterLog, eaPAAnonLog)
+    /\ AnonAndFilterLogsMatchAccLog(eaPAAccLog, eaPAFilterLog, eaPAAnonLog)
 
 \* =================
 \* Other invariants
@@ -1057,7 +1055,7 @@ Inv_Voter1LatestTallied ==
 Inv_Voter2RevokedFiltered ==
   AuditReady =>	
 		/\ ~(\E b \in paFilteredBB : b.voter.voterId = "voter2")
-		/\ \E e \in eaPAFilterLog : e.voterId = "voter2" /\ e.ballotId = 1002
+		/\ \E e \in eaPAFilterLog : e.voterId = "voter2" /\ e.h = Hash(ExpectedCSExportFromScenario[1002].bdoc.ct)
 
 Inv_AliceWinsElection == AuditReady => PlainCount("Alice") > PlainCount("Bob")
 
