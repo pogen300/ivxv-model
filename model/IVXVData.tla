@@ -119,8 +119,8 @@ EmptyBallot == Ballot(NoInt, NoInt, NoVoter, {})
 VoterBallot(voterId, ballots, isRevoked) == [ voterId |-> voterId, ballots |-> ballots, isRevoked |-> isRevoked ]
 EmptyVoterBallot == VoterBallot(NoStr, {}, FALSE)
 
-BallotResponse(ballot, req, resp) == [ ballot |-> ballot, req |-> req, resp |-> resp ]
-EmptyBallotResponse == BallotResponse(EmptyBallot, NoTSPReq, NoTSPRes)
+BallotResponse(ballot, resp) == [ ballot |-> ballot, resp |-> resp ]
+EmptyBallotResponse == BallotResponse(EmptyBallot, NoTSPRes)
 
 PALogEntry(t, h, voterId) == [ t |-> t, h |-> h, voterId |-> voterId ]
 
@@ -147,7 +147,7 @@ ElectionResult(tally, plain, proofs, invalid, sigTally, sigPlain) ==
 
 EmptyElectionResult == ElectionResult({}, {}, {}, {}, Empty, Empty)
 
-\* TODO
+\* Abstract shuffle-proof record. Verificatum proof internals are outside the baseline model.
 ShuffleProof(pk, in, out) == [ pk |-> pk, in |-> in, out |-> out ]
 EmptyShuffleProof == ShuffleProof(Empty, {}, {})
 
@@ -174,8 +174,8 @@ ProviderEntry(sidProv, phone, kind, challenge, sig) ==
 EmptyProviderEntry == ProviderEntry(NoInt, NoStr, NoStr, Empty, Empty)
 EmptyProviderSessionStore == [sid \in {} |-> EmptyProviderEntry]
 
-RegLogEntry(req, resp) == [ req |-> req, resp |-> resp ]
-NoRegLogEntry == RegLogEntry(NoTSPReq, NoTSPRes)
+RegLogEntry(req) == req
+NoRegLogEntry == NoTSPReq
 EmptyRegStore == [idx \in {} |-> NoRegLogEntry]
 EmptyOCSPStore == [idx \in {} |-> NoOCSPRes]
 

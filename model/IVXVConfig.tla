@@ -162,8 +162,9 @@ ExpectedCSExportFromScenario ==
 
 ExpectedRegExportFromScenario ==
   [i \in ScenarioIds |->
-    LET vote == ExpectedCSExportFromScenario[ScenarioVid(i)] IN
-      RegLogEntry(ExtractTSPReqFromResp(vote.tsp), vote.tsp)]
+    LET vote == ExpectedCSExportFromScenario[ScenarioVid(i)]
+        m == Hash(vote.bdoc.sig)
+    IN RegLogEntry(TSPReq(m, Sign(TSPClientSK, m)))]
 
 \* Tally phase
 RevokeList == {"voter2"}

@@ -10,7 +10,7 @@ RegPid == 5
 VVDPid == 6
 
 VerifyTSPCS(cfg, req, res, now) ==
-	/\ ExtractTSPReqFromResp(res) = req /\ res.cert = cfg.cfg.tspRegCert
+	/\ res.m = req.m /\ res.n = req.n /\ res.cert = cfg.cfg.tspRegCert
   /\ Verify(cfg.cfg.tspClientPK, res.m, res.n)
   /\ (-cfg.tSPPastSlack < res.t - now) /\ (res.t - now < cfg.tSPFutureSlack)
   /\ Verify(CertPK(res.cert), <<res.m, res.n, res.t>>, res.sig)
@@ -786,7 +786,7 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
   	with (p = chCSToReg.body.payload) {
       with (t = PhaseTSPTime) {
         with (tsp = TSPRes(p.m, p.n, t, TSPRegCert, Sign(TSPRegSK, <<p.m, p.n, t>>))) {
-			    regStore := StorePut(regStore, regNextIdx, RegLogEntry(p, tsp));
+			    regStore := StorePut(regStore, regNextIdx, RegLogEntry(p));
           regNextIdx := regNextIdx + 1;
 			    chRegToCS := RegToCS("TSPRes", tsp);
         };
@@ -907,7 +907,7 @@ VerifyAndUpdateSession(cfg, store, sid, stage, tok, voterRef, now) ==
 }
 end algorithm; *)
 
-\* BEGIN TRANSLATION (chksum(pcal) = "791735d1" /\ chksum(tla) = "d2f6611f")
+\* BEGIN TRANSLATION (chksum(pcal) = "33f73296" /\ chksum(tla) = "4b0e3528")
 VARIABLES pc, scenarioIdx, chVoterToVCD, chVCDToVoter, chVCDToCS, chCSToVCD, 
           chCSToProvider, chProviderToCS, chProviderToSign, chSignToProvider, 
           chSignToVoter, chVoterToSign, chCSToReg, chRegToCS, chVCDToVVD, 
@@ -3127,7 +3127,7 @@ Reg_RecvTSPReq == /\ pc[RegPid] = "Reg_RecvTSPReq"
                   /\ LET p == chCSToReg.body.payload IN
                        /\ LET t == PhaseTSPTime IN
                             LET tsp == TSPRes(p.m, p.n, t, TSPRegCert, Sign(TSPRegSK, <<p.m, p.n, t>>)) IN
-                              /\ regStore' = StorePut(regStore, regNextIdx, RegLogEntry(p, tsp))
+                              /\ regStore' = StorePut(regStore, regNextIdx, RegLogEntry(p))
                               /\ regNextIdx' = regNextIdx + 1
                               /\ chRegToCS' = RegToCS("TSPRes", tsp)
                        /\ chCSToReg' = NoMsg

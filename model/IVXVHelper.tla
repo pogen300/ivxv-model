@@ -20,10 +20,12 @@ DecryptShareStore(cardStore) == [ i \in DOMAIN cardStore |-> cardStore[i].decSha
 SignShareStore(cardStore) == [i \in DOMAIN cardStore |-> cardStore[i].sigShare]
 
 \* Voting
+TSPKeyFromReq(req) == req.m
+TSPKeyFromResp(resp) == resp.m
 CSHasBallot(bdoc, ballotStore) ==
   \E v \in DOMAIN ballotStore: ballotStore[v].bdoc = bdoc
 RegHasTSPFor(bdoc, regStore) ==
-  \E i \in DOMAIN regStore: regStore[i].resp.m = Hash(bdoc.sig)
+  \E i \in DOMAIN regStore: TSPKeyFromReq(regStore[i]) = Hash(bdoc.sig)
 CreateAuthToken(k, cert, vid, nonce) == AEADEnc(k, << cert, vid >>, nonce)
 OpenAuthToken(k, tok) == AEADDec(k, tok)
 VerifyTrustedX509Cert(rootCACert, cert) ==
@@ -50,15 +52,14 @@ ProviderSidForPhone(store, phone, kind) ==
   IF ProviderSidsForPhone(store, phone, kind) # {}
   THEN CHOOSE sid \in ProviderSidsForPhone(store, phone, kind): TRUE
   ELSE NoInt
-ExtractTSPReqFromResp(res) == TSPReq(res.m, res.n)
-
 \* Tally
 BallotHash(b) == Hash(<< b.id, b.t, b.votes >>)
-RegReqs(regExport) == {regExport[i].req: i \in DOMAIN regExport}
-RegIdxsForReq(req, regExport) == { i \in DOMAIN regExport: regExport[i].req = req }
-BallotRespIdxsForResp(resp, brMap) == {i \in DOMAIN brMap: brMap[i].resp = resp}
+RegReqs(regExport) == {regExport[i]: i \in DOMAIN regExport}
+RegIdxsForReq(req, regExport) == { i \in DOMAIN regExport: regExport[i] = req }
+BallotRespIdxsForRegKey(key, brMap) ==
+  {i \in DOMAIN brMap: TSPKeyFromResp(brMap[i].resp) = key}
 KeepEarliestBallotResp(i, brMap) ==
-  \A j \in BallotRespIdxsForResp(brMap[i].resp, brMap):
+  \A j \in BallotRespIdxsForRegKey(TSPKeyFromResp(brMap[i].resp), brMap):
     \/ brMap[i].ballot.t < brMap[j].ballot.t
     \/ /\ brMap[i].ballot.t = brMap[j].ballot.t
        /\ i <= j

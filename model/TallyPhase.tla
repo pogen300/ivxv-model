@@ -33,10 +33,9 @@ CreateBallotResponseErr(cfg, voterList, r) ==
     [] OTHER -> OK
 
 CreateBallotResponse(cfg, voterList, r) ==
-  LET req == ExtractTSPReqFromResp(r.tsp)
-      b ==  Ballot(r.vid, r.tsp.t, voterList[r.voterId], [ q \in {cfg.question} |-> r.bdoc.ct])
+  LET b ==  Ballot(r.vid, r.tsp.t, voterList[r.voterId], [ q \in {cfg.question} |-> r.bdoc.ct])
   IN IF CreateBallotResponseErr(cfg, voterList, r) = OK
-     THEN BallotResponse(b, req, r.tsp)
+     THEN BallotResponse(b, r.tsp)
      ELSE EmptyBallotResponse
 
 LoadedBallotResponses(cfg, voterList, csExport) ==
@@ -61,7 +60,7 @@ LoadBallotFileRecord(cfg, voterList, csExport) ==
 \* Load Reg Export
 LoadRegData(regExport) ==
   [ good |-> [ i \in { j \in DOMAIN regExport :
-                         Cardinality(RegIdxsForReq(StoreLookup(regExport, j).req, regExport)) = 1 }
+                         Cardinality(RegIdxsForReq(StoreLookup(regExport, j), regExport)) = 1 }
                |-> StoreLookup(regExport, i) ],
     err  |-> { CreatePAErrorLogEntry(NoStr, NoInt, REG_REQ_NOT_UNIQUE) :
                  req \in { x \in RegReqs(regExport) :
@@ -69,16 +68,13 @@ LoadRegData(regExport) ==
 
 \* Consistency check CS-Reg
 CheckCSRegConsistencyErr(br, regExport) ==
-  CASE ~(\E i \in DOMAIN regExport : StoreLookup(regExport, i).req = br.req) -> BALLOT_WITHOUT_REG_REQ
-    [] ~(\E i \in DOMAIN regExport :
-           /\ StoreLookup(regExport, i).req = br.req
-           /\ StoreLookup(regExport, i).resp = br.resp) -> REG_RESP_REQ_UNMATCH
+  CASE ~(\E i \in DOMAIN regExport :
+           TSPKeyFromReq(StoreLookup(regExport, i)) = TSPKeyFromResp(br.resp)) -> BALLOT_WITHOUT_REG_REQ
     [] OTHER -> OK
 
 CheckRegCSConsistencyErr(e, cs) ==
   CASE ~(\E i \in DOMAIN cs :
-           /\ e.req = StoreLookup(cs, i).req
-           /\ e.resp = StoreLookup(cs, i).resp) -> REG_REQ_WITHOUT_BALLOT
+           TSPKeyFromReq(e) = TSPKeyFromResp(StoreLookup(cs, i).resp)) -> REG_REQ_WITHOUT_BALLOT
   [] OTHER -> OK
 
 CheckCSRegConsistency(cs, reg) ==
